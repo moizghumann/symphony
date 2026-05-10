@@ -261,6 +261,63 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Protocol do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:version, :string, default: "1")
+      field(:repo_changes_require_pr, :boolean, default: true)
+      field(:human_review_requires_pr, :boolean, default: true)
+      field(:blocked_state, :string, default: "Blocked")
+      field(:review_state, :string, default: "Human Review")
+      field(:in_progress_state, :string, default: "In Progress")
+      field(:done_state, :string, default: "Done")
+      field(:canceled_state, :string, default: "Canceled")
+      field(:duplicate_state, :string, default: "Duplicate")
+      field(:allow_ticket_to_disable_pr, :boolean, default: false)
+      field(:generic_linear_graphql_policy, :string, default: "fallback_only")
+      field(:validation_gate, :boolean, default: true)
+      field(:finalization_gate, :boolean, default: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :version,
+          :repo_changes_require_pr,
+          :human_review_requires_pr,
+          :blocked_state,
+          :review_state,
+          :in_progress_state,
+          :done_state,
+          :canceled_state,
+          :duplicate_state,
+          :allow_ticket_to_disable_pr,
+          :generic_linear_graphql_policy,
+          :validation_gate,
+          :finalization_gate
+        ],
+        empty_values: []
+      )
+      |> validate_required([
+        :version,
+        :blocked_state,
+        :review_state,
+        :in_progress_state,
+        :done_state,
+        :canceled_state,
+        :duplicate_state
+      ])
+      |> validate_inclusion(:generic_linear_graphql_policy, ["fallback_only", "allowed"])
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -271,6 +328,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:protocol, Protocol, on_replace: :update, defaults_to_struct: true)
     field(:lanes, :map, default: %{})
   end
 
@@ -364,6 +422,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:protocol, with: &Protocol.changeset/2)
   end
 
   defp finalize_settings(settings) do

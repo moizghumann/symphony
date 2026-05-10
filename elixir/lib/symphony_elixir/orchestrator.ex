@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{AgentRunner, Config, JobPacket, LaneClassifier, LanePolicy, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Protocol.{Contract, FinalizationGate, StateTransitionGuard}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -1121,15 +1122,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp move_todo_issue_to_in_progress(%Issue{state: state_name} = issue) do
     if normalize_issue_state(state_name) == "todo" do
-      case Tracker.move_issue_to_state(issue, "In Progress") do
-        :ok ->
-          {:ok, %{issue | state: "In Progress", orchestrator_lifecycle_events: [orchestrator_transition("Todo", "In Progress", true)]}}
+      contract = Contract.current()
+      target_state = contract.in_progress_state
 
-        {:error, reason} ->
-          {:error, reason}
+      violations =
+        StateTransitionGuard.validate(
+          %{current_state: issue.state, available_states: issue.available_states},
+          target_state,
+          contract
+        )
+
+      if Enum.any?(violations, &(&1.severity == :blocking)) do
+        {:error, {:state_transition_blocked, violations}}
+      else
+        move_issue_after_transition_guard(issue, target_state)
       end
     else
       {:ok, issue}
+    end
+  end
+
+  defp move_issue_after_transition_guard(issue, target_state) do
+    case Tracker.move_issue_to_state(issue, target_state) do
+      :ok ->
+        {:ok, %{issue | state: target_state, orchestrator_lifecycle_events: [orchestrator_transition("Todo", target_state, true)]}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1421,8 +1440,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
     else
       Logger.warning("Stopping issue after budget exceeded: issue_id=#{issue_id} reason=#{reason}")
-      _ = Tracker.post_handoff_comment(issue, budget_blocker_comment(running_entry, reason))
-      _ = Tracker.move_issue_to_blocked(issue)
+      handoff_result = Tracker.post_handoff_comment(issue, budget_blocker_comment(running_entry, reason))
+      _ = move_issue_to_blocked_after_handoff(issue, reason, handoff_result)
 
       state
       |> terminate_running_issue(issue_id, false)
@@ -1431,6 +1450,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_enforce_budget_limit(state, _issue_id, _running_entry), do: state
+
+  defp move_issue_to_blocked_after_handoff(%Issue{} = issue, reason, handoff_result) do
+    contract = Contract.current()
+
+    gate_state = %{
+      current_state: issue.state,
+      available_states: issue.available_states,
+      blocker_reason: to_string(reason),
+      handoff_posted: handoff_result == :ok,
+      repo_changed: false,
+      changed_files: []
+    }
+
+    case FinalizationGate.evaluate(gate_state, contract.blocked_state, contract) do
+      {:ok, _gate_result} -> Tracker.move_issue_to_blocked(issue)
+      {:blocked, gate_result} -> {:error, {:finalization_gate_blocked, gate_result}}
+    end
+  end
 
   defp budget_exceeded?(value, budget) when is_integer(value) and is_integer(budget), do: value > budget
   defp budget_exceeded?(_value, _budget), do: false

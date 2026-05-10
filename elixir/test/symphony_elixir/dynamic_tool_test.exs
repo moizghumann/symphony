@@ -58,13 +58,27 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     issue = %Issue{
       id: "issue-1",
+      state: "In Progress",
       available_states: [%{id: "state-human-review", name: "Human Review"}]
     }
 
     response =
       DynamicTool.execute(
         "linear_move_to_human_review",
-        %{"issue_id" => "issue-1"},
+        %{
+          "issue_id" => "issue-1",
+          "lane" => "docs",
+          "changed_files" => ["README.md"],
+          "branch_name" => "agent/docs",
+          "commit_sha" => "abc123",
+          "branch_pushed" => true,
+          "pr_url" => "https://github.com/moizghumann/symphony/pull/4",
+          "pr_posted_to_linear" => true,
+          "handoff_posted" => true,
+          "validation_required" => false,
+          "validation_status" => "not_run",
+          "validation_reason" => "docs-only/text-only change"
+        },
         issue: issue,
         linear_lifecycle_graphql: fn query, variables ->
           send(test_pid, {:linear_lifecycle_graphql_called, query, variables})
@@ -78,6 +92,34 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     refute query =~ "states("
     assert response["success"] == true
     assert Jason.decode!(response["output"])["state"] == "Human Review"
+  end
+
+  test "linear_move_to_human_review is blocked by finalization gate without PR artifacts" do
+    issue = %Issue{
+      id: "issue-1",
+      state: "In Progress",
+      available_states: [%{id: "state-human-review", name: "Human Review"}]
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_move_to_human_review",
+        %{"issue_id" => "issue-1"},
+        issue: issue,
+        linear_lifecycle_graphql: fn _query, _variables ->
+          flunk("state mutation should not run when finalization artifacts are missing")
+        end
+      )
+
+    assert response["success"] == false
+
+    output = Jason.decode!(response["output"])
+    assert output["error"]["code"] == "finalization_gate_blocked"
+
+    assert Enum.any?(
+             output["error"]["protocol_violations"],
+             &(&1["code"] == "pr_required_but_missing")
+           )
   end
 
   test "linear_move_state fails clearly when target state is absent from resolved state map" do
@@ -98,14 +140,13 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert Jason.decode!(response["output"]) == %{
-             "error" => %{
-               "available_states" => ["Todo"],
-               "code" => "state_not_found",
-               "message" => "Requested Linear state was not found in the resolved state map.",
-               "requested_state" => "Human Review"
-             }
-           }
+    output = Jason.decode!(response["output"])
+    assert output["error"]["code"] == "finalization_gate_blocked"
+
+    assert Enum.any?(
+             output["error"]["protocol_violations"],
+             &(&1["code"] == "state_not_found")
+           )
   end
 
   test "linear_post_handoff returns the created comment id" do

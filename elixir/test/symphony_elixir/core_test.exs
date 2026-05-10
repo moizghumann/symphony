@@ -1996,7 +1996,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff","body":"README onboarding is clear; no repo changes needed."}}}'
             ;;
           5)
-            printf '%s\\n' '{"id":202,"method":"item/tool/call","params":{"name":"linear_move_to_human_review","callId":"call-review","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff"}}}'
+            printf '%s\\n' '{"id":202,"method":"item/tool/call","params":{"name":"linear_move_to_human_review","callId":"call-review","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff","repo_changed":false,"lane":"research","findings_posted":true,"sources_inspected_listed":true,"recommendation_included":true,"handoff_posted":true,"validation_required":false,"validation_status":"not_run"}}}'
             ;;
           6)
             printf '%s\\n' '{"method":"turn/completed"}'

@@ -89,6 +89,20 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+protocol:
+  version: "1"
+  repo_changes_require_pr: true
+  human_review_requires_pr: true
+  blocked_state: "Blocked"
+  review_state: "Human Review"
+  in_progress_state: "In Progress"
+  done_state: "Done"
+  canceled_state: "Canceled"
+  duplicate_state: "Duplicate"
+  allow_ticket_to_disable_pr: false
+  generic_linear_graphql_policy: fallback_only
+  validation_gate: true
+  finalization_gate: true
 ---
 
 You are working on Linear issue `{{ issue.identifier }}`.

@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, GitHubHandoff, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Protocol.{Contract, FinalizationGate}
 
   @handoff_ready_marker "SYMPHONY_HANDOFF_READY"
 
@@ -177,7 +178,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp block_issue_for_max_turns(issue, max_turns) do
-    _ =
+    handoff_result =
       Tracker.post_handoff_comment(issue, """
       ## Symphony Handoff Blocked
 
@@ -187,8 +188,26 @@ defmodule SymphonyElixir.AgentRunner do
       Lane: #{lane_name(issue)}
       """)
 
-    _ = Tracker.move_issue_to_blocked(issue)
+    _ = move_issue_to_blocked_after_handoff(issue, "max turns exhausted", handoff_result)
     :ok
+  end
+
+  defp move_issue_to_blocked_after_handoff(%Issue{} = issue, reason, handoff_result) do
+    contract = Contract.current()
+
+    gate_state = %{
+      current_state: issue.state,
+      available_states: issue.available_states,
+      blocker_reason: reason,
+      handoff_posted: handoff_result == :ok,
+      repo_changed: false,
+      changed_files: []
+    }
+
+    case FinalizationGate.evaluate(gate_state, contract.blocked_state, contract) do
+      {:ok, _gate_result} -> Tracker.move_issue_to_blocked(issue)
+      {:blocked, gate_result} -> {:error, {:finalization_gate_blocked, gate_result}}
+    end
   end
 
   defp lane_name(%Issue{lane_classification: %{lane: lane}}), do: lane
