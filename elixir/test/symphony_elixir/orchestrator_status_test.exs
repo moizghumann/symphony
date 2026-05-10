@@ -101,6 +101,86 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator-owned lifecycle calls are exposed in presenter payload" do
+    issue_id = "issue-lifecycle-trace"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-LIFE",
+      title: "Lifecycle trace test",
+      description: "Capture lifecycle trace",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-LIFE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :LifecycleTraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-life-turn-life",
+      turn_count: 1,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _state ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :linear_lifecycle_call,
+         timestamp: now,
+         tool_name: "linear_post_handoff",
+         tool_arguments: %{issue_id: issue_id, body: "handoff"},
+         tool_result: %{"success" => true, "comment_id" => "comment-life"}
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :linear_lifecycle_call,
+         timestamp: now,
+         tool_name: "linear_move_to_human_review",
+         tool_arguments: %{issue_id: issue_id},
+         tool_result: %{"success" => true}
+       }}
+    )
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 1_000)
+    [running] = payload.running
+
+    assert running.linear_lifecycle.generic_graphql_calls == 0
+    assert running.linear_lifecycle.narrow_tool_calls == 2
+    assert running.linear_lifecycle.handoff_comment_id == "comment-life"
+
+    assert running.linear_lifecycle.issue_state_transitions == [
+             %{tool: "linear_move_to_human_review", to: "Human Review", success: true}
+           ]
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

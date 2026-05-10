@@ -379,6 +379,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "input_tokens" => 100,
                    "output_tokens" => 7,
                    "total_tokens" => 120
+                 },
+                 "linear_lifecycle" => %{
+                   "blocked_reason" => nil,
+                   "generic_graphql_calls" => 0,
+                   "generic_graphql_fallback_reasons" => [],
+                   "handoff_comment_id" => nil,
+                   "issue_state_transitions" => [],
+                   "narrow_tool_calls" => 0
                  }
                }
              ],
@@ -438,6 +446,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "input_tokens" => 100,
                  "output_tokens" => 7,
                  "total_tokens" => 120
+               },
+               "linear_lifecycle" => %{
+                 "blocked_reason" => nil,
+                 "generic_graphql_calls" => 0,
+                 "generic_graphql_fallback_reasons" => [],
+                 "handoff_comment_id" => nil,
+                 "issue_state_transitions" => [],
+                 "narrow_tool_calls" => 0
                }
              },
              "retry" => nil,
