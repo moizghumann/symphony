@@ -6,6 +6,7 @@ defmodule SymphonyElixir.GitHubHandoff do
   require Logger
 
   alias SymphonyElixir.{Linear.Issue, SSH, Tracker}
+  alias SymphonyElixir.Protocol.{Contract, FinalizationGate, Validation}
 
   @type worker_host :: String.t() | nil
   @type result :: :no_repo_changes | {:ok, String.t()} | {:error, term()}
@@ -16,20 +17,35 @@ defmodule SymphonyElixir.GitHubHandoff do
   @spec complete(Path.t(), Issue.t(), worker_host()) :: result()
   def complete(workspace, %Issue{} = issue, worker_host) when is_binary(workspace) do
     with :ok <- ensure_git_repo(workspace, worker_host),
-         true <- repo_changing_ticket?(workspace, worker_host),
+         {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host),
+         true <- artifacts.repo_changed,
          {:ok, branch} <- ensure_branch(workspace, issue, worker_host),
          :ok <- ensure_committed(workspace, worker_host),
+         {:ok, commit_sha} <- head_sha(workspace, worker_host),
          :ok <- ensure_pushed(workspace, branch, worker_host),
          {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url),
-         :ok <- Tracker.move_issue_to_state(issue, "Human Review") do
+         :ok <-
+           move_to_human_review(
+             issue,
+             Map.merge(artifacts, %{
+               branch_name: branch,
+               commit_sha: commit_sha,
+               branch_pushed: true,
+               pr_url: pr_url,
+               pr_created: true,
+               pr_is_draft: true,
+               pr_posted_to_linear: true,
+               handoff_posted: true
+             })
+           ) do
       {:ok, pr_url}
     else
       false ->
-        :no_repo_changes
+        complete_read_only_handoff(workspace, issue, worker_host)
 
       {:error, :not_a_git_repo} ->
-        :no_repo_changes
+        complete_read_only_handoff(workspace, issue, worker_host)
 
       {:error, reason} = error ->
         block_issue(issue, reason)
@@ -53,12 +69,69 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp repo_changing_ticket?(workspace, worker_host) do
+  defp repo_artifacts(workspace, %Issue{} = issue, worker_host) do
     with {:ok, status} <- run(workspace, "git", ["status", "--porcelain"], worker_host),
-         {:ok, ahead} <- run(workspace, "git", ["rev-list", "--count", "origin/main..HEAD"], worker_host) do
-      String.trim(status) != "" or parse_count(ahead) > 0
+         {:ok, ahead} <- run(workspace, "git", ["rev-list", "--count", "origin/main..HEAD"], worker_host),
+         {:ok, changed} <- changed_files(workspace, worker_host) do
+      repo_changed = String.trim(status) != "" or parse_count(ahead) > 0 or changed != []
+      lane = infer_lane(issue, changed)
+      validation = Validation.summarize(workspace, changed, lane: lane)
+
+      {:ok,
+       Map.merge(validation, %{
+         lane: lane,
+         classification_reason: "inferred from labels/title/files during handoff",
+         repo_changed: repo_changed,
+         changed_files: changed,
+         branch_name: nil,
+         commit_sha: nil,
+         pr_url: nil,
+         pr_created: false,
+         pr_posted_to_linear: false,
+         handoff_posted: false,
+         branch_pushed: false,
+         current_state: issue.state,
+         available_states: issue.available_states,
+         ticket_text: issue_text(issue),
+         budget_state: :ok
+       })}
     else
-      _ -> false
+      {:error, reason} -> {:error, {:repo_artifacts_failed, reason}}
+    end
+  end
+
+  defp changed_files(workspace, worker_host) do
+    case run(workspace, "git", ["diff", "--name-only", "origin/main...HEAD"], worker_host) do
+      {:ok, output} ->
+        files =
+          output
+          |> String.split("\n", trim: true)
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.uniq()
+
+        {:ok, files}
+
+      {:error, _reason} ->
+        changed_files_from_status(workspace, worker_host)
+    end
+  end
+
+  defp changed_files_from_status(workspace, worker_host) do
+    case run(workspace, "git", ["status", "--porcelain"], worker_host) do
+      {:ok, output} ->
+        files =
+          output
+          |> String.split("\n", trim: true)
+          |> Enum.map(&String.slice(&1, 3..-1//1))
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.uniq()
+
+        {:ok, files}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -76,6 +149,13 @@ defmodule SymphonyElixir.GitHubHandoff do
     case run(workspace, "git", ["branch", "--show-current"], worker_host) do
       {:ok, output} -> {:ok, String.trim(output)}
       {:error, reason} -> {:error, {:git_current_branch_failed, reason}}
+    end
+  end
+
+  defp head_sha(workspace, worker_host) do
+    case run(workspace, "git", ["rev-parse", "HEAD"], worker_host) do
+      {:ok, output} -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, {:git_commit_failed, reason}}
     end
   end
 
@@ -152,10 +232,71 @@ defmodule SymphonyElixir.GitHubHandoff do
     Tracker.post_handoff_comment(issue, handoff_comment(issue, pr_url))
   end
 
+  defp complete_read_only_handoff(workspace, %Issue{} = issue, worker_host) do
+    artifacts = %{
+      lane: infer_lane(issue, []),
+      repo_changed: false,
+      changed_files: [],
+      current_state: issue.state,
+      available_states: issue.available_states,
+      validation_required: false,
+      validation_status: :not_run,
+      validation_reason: "read-only/no repository changes",
+      findings_posted: true,
+      sources_inspected_listed: true,
+      recommendation_included: true,
+      handoff_posted: false,
+      budget_state: :ok
+    }
+
+    with :ok <- Tracker.post_handoff_comment(issue, read_only_handoff_comment(issue, workspace, worker_host)),
+         :ok <- move_to_human_review(issue, %{artifacts | handoff_posted: true}) do
+      :no_repo_changes
+    else
+      {:error, reason} = error ->
+        block_issue(issue, reason)
+        error
+    end
+  end
+
+  defp move_to_human_review(%Issue{} = issue, artifacts) when is_map(artifacts) do
+    contract = Contract.current()
+
+    case FinalizationGate.evaluate(artifacts, contract.review_state, contract) do
+      {:ok, gate_result} ->
+        Logger.info("Finalization gate allowed Human Review issue_id=#{issue.id} issue_identifier=#{issue.identifier} reason=#{gate_result.finalization_reason}")
+        Tracker.move_issue_to_state(issue, contract.review_state)
+
+      {:blocked, gate_result} ->
+        reason = {:finalization_gate_blocked, gate_result}
+        block_issue(issue, reason)
+        {:error, reason}
+    end
+  end
+
   defp block_issue(issue, reason) do
     Logger.warning("Blocking issue after publish handoff failure issue_id=#{issue.id} issue_identifier=#{issue.identifier} reason=#{inspect(reason)}")
-    _ = Tracker.post_handoff_comment(issue, blocked_comment(reason))
-    _ = Tracker.move_issue_to_blocked(issue)
+
+    handoff_posted? = Tracker.post_handoff_comment(issue, blocked_comment(reason)) == :ok
+    contract = Contract.current()
+
+    gate_state = %{
+      current_state: issue.state,
+      available_states: issue.available_states,
+      blocker_reason: inspect(reason),
+      handoff_posted: handoff_posted?,
+      repo_changed: false,
+      changed_files: []
+    }
+
+    case FinalizationGate.evaluate(gate_state, contract.blocked_state, contract) do
+      {:ok, _gate_result} ->
+        _ = Tracker.move_issue_to_state(issue, contract.blocked_state)
+
+      {:blocked, gate_result} ->
+        Logger.warning("Finalization gate blocked Blocked transition issue_id=#{issue.id} issue_identifier=#{issue.identifier} reason=#{inspect(gate_result.protocol_violations)}")
+    end
+
     :ok
   end
 
@@ -194,6 +335,19 @@ defmodule SymphonyElixir.GitHubHandoff do
 
     Issue: #{issue.identifier || issue.id}
     State: Human Review
+    """
+  end
+
+  defp read_only_handoff_comment(%Issue{} = issue, workspace, worker_host) do
+    """
+    ## Symphony Handoff
+
+    No repository file changes were detected, so no PR was required.
+
+    Issue: #{issue.identifier || issue.id}
+    State: Human Review
+    Workspace: #{workspace}
+    Worker: #{worker_host || "local"}
     """
   end
 
@@ -249,6 +403,40 @@ defmodule SymphonyElixir.GitHubHandoff do
       {count, _} -> count
       _ -> 0
     end
+  end
+
+  defp infer_lane(%Issue{} = issue, changed_files) do
+    text =
+      ([issue.title, issue.description] ++ List.wrap(issue.labels))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map_join(" ", &to_string/1)
+      |> String.downcase()
+
+    text_lane = lane_from_text(text)
+
+    cond do
+      text_lane != nil -> text_lane
+      changed_files != [] and !FinalizationGate.code_bearing_changes?(changed_files) -> "docs"
+      true -> "feature"
+    end
+  end
+
+  defp lane_from_text(text) do
+    cond do
+      String.contains?(text, ["bug", "fix", "regression"]) -> "bug"
+      String.contains?(text, ["refactor", "cleanup"]) -> "refactor"
+      String.contains?(text, ["test", "coverage", "spec"]) -> "test"
+      String.contains?(text, ["chore", "ci", "config", "dependency", "deps"]) -> "chore"
+      String.contains?(text, ["research", "investigate", "analysis"]) -> "research"
+      String.contains?(text, ["docs", "documentation", "readme"]) -> "docs"
+      true -> nil
+    end
+  end
+
+  defp issue_text(%Issue{} = issue) do
+    [issue.title, issue.description]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map_join("\n", &to_string/1)
   end
 
   defp git_not_a_repo_error?({_status, output}) when is_binary(output) do

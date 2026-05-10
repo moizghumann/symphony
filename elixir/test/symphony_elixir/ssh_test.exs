@@ -170,12 +170,14 @@ defmodule SymphonyElixir.SSHTest do
 
     File.write!(
       fake_ssh,
-      script ||
-        """
-        #!/bin/sh
-        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-        exit 0
-        """
+      String.trim_leading(
+        script ||
+          """
+          #!/bin/sh
+          printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+          exit 0
+          """
+      )
     )
 
     File.chmod!(fake_ssh, 0o755)

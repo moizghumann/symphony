@@ -12,17 +12,18 @@ defmodule SymphonyElixir.SSH do
   def start_port(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     with {:ok, executable} <- ssh_executable() do
       line_bytes = Keyword.get(opts, :line)
+      {port_executable, args} = port_executable_and_args(executable, ssh_args(host, command))
 
       port_opts =
         [
           :binary,
           :exit_status,
           :stderr_to_stdout,
-          args: Enum.map(ssh_args(host, command), &String.to_charlist/1)
+          args: Enum.map(args, &String.to_charlist/1)
         ]
         |> maybe_put_line_option(line_bytes)
 
-      {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+      {:ok, Port.open({:spawn_executable, String.to_charlist(port_executable)}, port_opts)}
     end
   end
 
@@ -58,6 +59,21 @@ defmodule SymphonyElixir.SSH do
 
       _ ->
         args
+    end
+  end
+
+  defp port_executable_and_args(executable, args) do
+    if script_executable?(executable) do
+      {"/bin/sh", [executable | args]}
+    else
+      {executable, args}
+    end
+  end
+
+  defp script_executable?(executable) do
+    case File.open(executable, [:read, :binary], fn file -> IO.binread(file, 2) end) do
+      {:ok, "#!"} -> true
+      _ -> false
     end
   end
 

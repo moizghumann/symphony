@@ -115,6 +115,12 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens,
         effective_tokens: effective_tokens_from(entry),
         effective_delta_tokens: Map.get(entry, :codex_last_effective_token_delta, 0)
+      },
+      protocol: %{
+        generic_linear_graphql_calls: Map.get(entry, :generic_linear_graphql_calls, []),
+        generic_graphql_fallback_reasons: Map.get(entry, :generic_graphql_fallback_reasons, []),
+        narrow_linear_tool_calls: Map.get(entry, :narrow_linear_tool_calls, []),
+        protocol_warnings: Map.get(entry, :protocol_warnings, [])
       }
     }
   end
@@ -149,6 +155,12 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: running.codex_total_tokens,
         effective_tokens: effective_tokens_from(running),
         effective_delta_tokens: Map.get(running, :codex_last_effective_token_delta, 0)
+      },
+      protocol: %{
+        generic_linear_graphql_calls: Map.get(running, :generic_linear_graphql_calls, []),
+        generic_graphql_fallback_reasons: Map.get(running, :generic_graphql_fallback_reasons, []),
+        narrow_linear_tool_calls: Map.get(running, :narrow_linear_tool_calls, []),
+        protocol_warnings: Map.get(running, :protocol_warnings, [])
       }
     }
   end

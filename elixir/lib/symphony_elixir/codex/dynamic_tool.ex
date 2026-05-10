@@ -23,6 +23,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "type" => ["object", "null"],
         "description" => "Optional GraphQL variables object.",
         "additionalProperties" => true
+      },
+      "fallback_reason" => %{
+        "type" => ["string", "null"],
+        "description" => "Why a narrow Symphony helper or issue packet was insufficient for this operation."
+      },
+      "operation" => %{
+        "type" => ["string", "null"],
+        "description" => "Short name for the Linear operation being performed."
+      },
+      "narrow_tool_available" => %{
+        "type" => ["boolean", "null"],
+        "description" => "Whether a narrow Symphony helper existed for this operation."
+      },
+      "narrow_tool_failed" => %{
+        "type" => ["boolean", "null"],
+        "description" => "Whether the narrow helper was attempted and failed before falling back."
       }
     }
   }

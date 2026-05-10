@@ -4,6 +4,7 @@ defmodule SymphonyElixir.PromptBuilder do
   """
 
   alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.Protocol.{Capsule, Contract}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -25,7 +26,7 @@ defmodule SymphonyElixir.PromptBuilder do
       )
       |> IO.iodata_to_binary()
 
-    [issue_packet_prompt(issue), "\n\n", rendered_prompt]
+    [issue_packet_prompt(issue), "\n\n", rendered_prompt, "\n\n", Capsule.render(Contract.current())]
     |> IO.iodata_to_binary()
   end
 

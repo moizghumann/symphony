@@ -379,6 +379,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "input_tokens" => 100,
                    "output_tokens" => 7,
                    "total_tokens" => 120
+                 },
+                 "protocol" => %{
+                   "generic_graphql_fallback_reasons" => [],
+                   "generic_linear_graphql_calls" => [],
+                   "narrow_linear_tool_calls" => [],
+                   "protocol_warnings" => []
                  }
                }
              ],
@@ -438,6 +444,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "input_tokens" => 100,
                  "output_tokens" => 7,
                  "total_tokens" => 120
+               },
+               "protocol" => %{
+                 "generic_graphql_fallback_reasons" => [],
+                 "generic_linear_graphql_calls" => [],
+                 "narrow_linear_tool_calls" => [],
+                 "protocol_warnings" => []
                }
              },
              "retry" => nil,

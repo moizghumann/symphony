@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Protocol.{Contract, StateTransitionGuard}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -736,6 +737,10 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             codex_last_reported_effective_tokens: 0,
+            generic_linear_graphql_calls: [],
+            generic_graphql_fallback_reasons: [],
+            narrow_linear_tool_calls: [],
+            protocol_warnings: [],
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1077,15 +1082,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp move_todo_issue_to_in_progress(%Issue{state: state_name} = issue) do
     if normalize_issue_state(state_name) == "todo" do
-      case Tracker.move_issue_to_state(issue, "In Progress") do
-        :ok ->
-          {:ok, %{issue | state: "In Progress"}}
+      contract = Contract.current()
+      target_state = contract.in_progress_state
 
-        {:error, reason} ->
-          {:error, reason}
+      violations =
+        StateTransitionGuard.validate(
+          %{current_state: issue.state, available_states: issue.available_states},
+          target_state,
+          contract
+        )
+
+      if Enum.any?(violations, &(&1.severity == :blocking)) do
+        {:error, {:state_transition_blocked, violations}}
+      else
+        move_issue_after_transition_guard(issue, target_state)
       end
     else
       {:ok, issue}
+    end
+  end
+
+  defp move_issue_after_transition_guard(issue, target_state) do
+    case Tracker.move_issue_to_state(issue, target_state) do
+      :ok ->
+        {:ok, %{issue | state: target_state}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1155,6 +1178,10 @@ defmodule SymphonyElixir.Orchestrator do
           codex_total_tokens: metadata.codex_total_tokens,
           codex_effective_tokens: Map.get(metadata, :codex_effective_tokens, 0),
           codex_last_effective_token_delta: Map.get(metadata, :codex_last_effective_token_delta, 0),
+          generic_linear_graphql_calls: Map.get(metadata, :generic_linear_graphql_calls, []),
+          generic_graphql_fallback_reasons: Map.get(metadata, :generic_graphql_fallback_reasons, []),
+          narrow_linear_tool_calls: Map.get(metadata, :narrow_linear_tool_calls, []),
+          protocol_warnings: Map.get(metadata, :protocol_warnings, []),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1222,8 +1249,9 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_effective = Map.get(running_entry, :codex_last_reported_effective_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
-      Map.merge(running_entry, %{
+    updated_running_entry =
+      running_entry
+      |> Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1241,9 +1269,59 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         codex_last_reported_effective_tokens: max(last_reported_effective, token_delta.effective_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
+      })
+      |> integrate_protocol_trace(update)
+
+    {updated_running_entry, token_delta}
+  end
+
+  defp integrate_protocol_trace(running_entry, %{tool_name: "linear_graphql", arguments: arguments} = update) do
+    call = generic_linear_graphql_call(arguments, update)
+    calls = Map.get(running_entry, :generic_linear_graphql_calls, []) ++ [call]
+    reasons = calls |> Enum.map(&Map.get(&1, :fallback_reason)) |> Enum.reject(&is_nil/1)
+    warnings = Map.get(running_entry, :protocol_warnings, []) ++ generic_linear_graphql_warnings(call)
+
+    Map.merge(running_entry, %{
+      generic_linear_graphql_calls: calls,
+      generic_graphql_fallback_reasons: reasons,
+      protocol_warnings: warnings
+    })
+  end
+
+  defp integrate_protocol_trace(running_entry, _update), do: running_entry
+
+  defp generic_linear_graphql_call(arguments, update) do
+    arguments = if is_map(arguments), do: arguments, else: %{}
+
+    %{
+      operation: Map.get(arguments, "operation") || Map.get(arguments, :operation) || graphql_operation_name(arguments),
+      fallback_reason: Map.get(arguments, "fallback_reason") || Map.get(arguments, :fallback_reason),
+      narrow_tool_available: Map.get(arguments, "narrow_tool_available") || Map.get(arguments, :narrow_tool_available),
+      narrow_tool_failed: Map.get(arguments, "narrow_tool_failed") || Map.get(arguments, :narrow_tool_failed),
+      success: update.event == :tool_call_completed
     }
+  end
+
+  defp graphql_operation_name(arguments) do
+    query = Map.get(arguments, "query") || Map.get(arguments, :query) || ""
+
+    case Regex.run(~r/\b(query|mutation)\s+([A-Za-z0-9_]+)/, query) do
+      [_match, _kind, operation] -> operation
+      _ -> nil
+    end
+  end
+
+  defp generic_linear_graphql_warnings(%{fallback_reason: reason} = call) do
+    cond do
+      !is_binary(reason) or String.trim(reason) == "" ->
+        [%{code: :generic_graphql_without_fallback_reason, severity: :warning, evidence: call}]
+
+      call.narrow_tool_available == true and call.narrow_tool_failed != true ->
+        [%{code: :unnecessary_generic_linear_graphql, severity: :warning, evidence: call}]
+
+      true ->
+        []
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
