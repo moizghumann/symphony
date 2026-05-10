@@ -199,8 +199,26 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
       })
 
     assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
-    assert violation?(result, :ticket_conflicts_with_workflow_policy)
+    refute violation?(result, :ticket_conflicts_with_workflow_policy)
+    assert warning?(result, :ticket_conflicts_with_workflow_policy)
     assert violation?(result, :pr_required_but_missing)
+  end
+
+  test "ticket PR conflict warns but allows Human Review when required PR artifacts exist" do
+    run_state =
+      base_run_state(%{
+        lane: "docs",
+        changed_files: ["README.md"],
+        ticket_text: "This is docs-only. no PR required.",
+        validation_required: false,
+        validation_status: :not_run,
+        validation_reason: "docs-only/text-only change"
+      })
+
+    assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    refute violation?(result, :ticket_conflicts_with_workflow_policy)
+    assert warning?(result, :ticket_conflicts_with_workflow_policy)
+    assert result.finalization_gate_result == :ok
   end
 
   test "generic GraphQL fallback emits warning when narrow helper was available and did not fail" do

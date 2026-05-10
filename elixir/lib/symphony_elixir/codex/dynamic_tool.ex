@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.{Client, Issue, Lifecycle}
+  alias SymphonyElixir.Protocol.{Contract, FinalizationGate}
 
   @linear_graphql_tool "linear_graphql"
   @linear_move_state_tool "linear_move_state"
@@ -76,11 +77,35 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "issue_id" => %{"type" => "string", "description" => "Resolved Linear issue id from the issue packet."}
     }
   }
-  @move_state_schema %{
+  @finalization_properties %{
+    "repo_changed" => %{"type" => ["boolean", "null"]},
+    "changed_files" => %{"type" => ["array", "null"], "items" => %{"type" => "string"}},
+    "branch_name" => %{"type" => ["string", "null"]},
+    "commit_sha" => %{"type" => ["string", "null"]},
+    "branch_pushed" => %{"type" => ["boolean", "null"]},
+    "pr_url" => %{"type" => ["string", "null"]},
+    "pr_posted_to_linear" => %{"type" => ["boolean", "null"]},
+    "handoff_posted" => %{"type" => ["boolean", "null"]},
+    "blocker_reason" => %{"type" => ["string", "null"]},
+    "validation_required" => %{"type" => ["boolean", "null"]},
+    "validation_status" => %{"type" => ["string", "null"]},
+    "validation_reason" => %{"type" => ["string", "null"]},
+    "lane" => %{"type" => ["string", "null"]},
+    "findings_posted" => %{"type" => ["boolean", "null"]},
+    "sources_inspected_listed" => %{"type" => ["boolean", "null"]},
+    "recommendation_included" => %{"type" => ["boolean", "null"]},
+    "merged" => %{"type" => ["boolean", "null"]},
+    "ticket_text" => %{"type" => ["string", "null"]}
+  }
+  @finalization_issue_schema %{
     @issue_id_schema
+    | "properties" => Map.merge(@issue_id_schema["properties"], @finalization_properties)
+  }
+  @move_state_schema %{
+    @finalization_issue_schema
     | "required" => ["issue_id", "state_name"],
       "properties" =>
-        Map.put(@issue_id_schema["properties"], "state_name", %{
+        Map.put(@finalization_issue_schema["properties"], "state_name", %{
           "type" => "string",
           "description" => "Target Linear workflow state name."
         })
@@ -138,13 +163,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       },
       %{
         "name" => @linear_move_to_human_review_tool,
-        "description" => "Move the current Linear issue to Human Review using the resolved state map.",
-        "inputSchema" => @issue_id_schema
+        "description" => "Move the current Linear issue to Human Review after finalization artifacts pass the protocol gate.",
+        "inputSchema" => @finalization_issue_schema
       },
       %{
         "name" => @linear_move_to_blocked_tool,
-        "description" => "Move the current Linear issue to Blocked using the resolved state map.",
-        "inputSchema" => @issue_id_schema
+        "description" => "Move the current Linear issue to Blocked after blocker evidence passes the protocol gate.",
+        "inputSchema" => @finalization_issue_schema
       },
       %{
         "name" => @linear_post_comment_tool,
@@ -206,6 +231,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp run_linear_lifecycle_tool(@linear_move_state_tool, issue, args, opts) do
     with {:ok, state_name} <- required_string(args, "state_name"),
+         :ok <- gate_final_state_transition(issue, state_name, args, opts),
          :ok <- Lifecycle.move_state(issue, state_name, lifecycle_opts(opts)) do
       {:ok, %{"state" => state_name}}
     end
@@ -217,15 +243,21 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp run_linear_lifecycle_tool(@linear_move_to_human_review_tool, issue, _args, opts) do
-    with :ok <- Lifecycle.move_to_human_review(issue, lifecycle_opts(opts)) do
-      {:ok, %{"state" => "Human Review"}}
+  defp run_linear_lifecycle_tool(@linear_move_to_human_review_tool, issue, args, opts) do
+    contract = protocol_contract(opts)
+
+    with :ok <- gate_final_state_transition(issue, contract.review_state, args, opts),
+         :ok <- Lifecycle.move_to_human_review(issue, lifecycle_opts(opts)) do
+      {:ok, %{"state" => contract.review_state}}
     end
   end
 
-  defp run_linear_lifecycle_tool(@linear_move_to_blocked_tool, issue, _args, opts) do
-    with :ok <- Lifecycle.move_to_blocked(issue, lifecycle_opts(opts)) do
-      {:ok, %{"state" => "Blocked"}}
+  defp run_linear_lifecycle_tool(@linear_move_to_blocked_tool, issue, args, opts) do
+    contract = protocol_contract(opts)
+
+    with :ok <- gate_final_state_transition(issue, contract.blocked_state, args, opts),
+         :ok <- Lifecycle.move_to_blocked(issue, lifecycle_opts(opts)) do
+      {:ok, %{"state" => contract.blocked_state}}
     end
   end
 
@@ -262,6 +294,71 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       fun when is_function(fun, 2) -> [graphql: fun]
       _ -> []
     end
+  end
+
+  defp gate_final_state_transition(%Issue{} = issue, target_state, args, opts) do
+    contract = protocol_contract(opts)
+
+    if target_state in [contract.review_state, contract.blocked_state, contract.done_state] do
+      run_state = finalization_run_state(issue, args, target_state, contract)
+
+      case FinalizationGate.evaluate(run_state, target_state, contract) do
+        {:ok, _result} -> :ok
+        {:blocked, result} -> {:error, {:finalization_gate_blocked, result}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp protocol_contract(opts) do
+    case Keyword.get(opts, :protocol_contract) do
+      %Contract{} = contract -> contract
+      _ -> Contract.current()
+    end
+  end
+
+  defp finalization_run_state(%Issue{} = issue, args, target_state, %Contract{} = contract) do
+    %{
+      current_state: issue.state,
+      available_states: issue.available_states,
+      repo_changed: arg(args, "repo_changed", default_repo_changed(target_state, args, contract)),
+      changed_files: arg(args, "changed_files", []),
+      branch_name: arg(args, "branch_name", issue.branch_name),
+      commit_sha: arg(args, "commit_sha"),
+      branch_pushed: arg(args, "branch_pushed"),
+      pr_url: arg(args, "pr_url"),
+      pr_posted_to_linear: arg(args, "pr_posted_to_linear"),
+      handoff_posted: arg(args, "handoff_posted"),
+      blocker_reason: arg(args, "blocker_reason"),
+      validation_required: arg(args, "validation_required"),
+      validation_status: arg(args, "validation_status"),
+      validation_reason: arg(args, "validation_reason"),
+      lane: arg(args, "lane", issue_lane(issue)),
+      findings_posted: arg(args, "findings_posted"),
+      sources_inspected_listed: arg(args, "sources_inspected_listed"),
+      recommendation_included: arg(args, "recommendation_included"),
+      merged: arg(args, "merged"),
+      ticket_text: arg(args, "ticket_text", issue.description)
+    }
+  end
+
+  defp default_repo_changed(target_state, args, %Contract{} = contract) do
+    if Map.has_key?(args, "repo_changed") or Map.has_key?(args, :repo_changed) do
+      arg(args, "repo_changed")
+    else
+      target_state == contract.review_state
+    end
+  end
+
+  defp issue_lane(%Issue{lane_classification: %{lane: lane}}) when is_binary(lane), do: lane
+  defp issue_lane(%Issue{lane_classification: %{lane: lane}}) when is_atom(lane), do: Atom.to_string(lane)
+  defp issue_lane(%Issue{lane_classification: %{"lane" => lane}}) when is_binary(lane), do: lane
+  defp issue_lane(%Issue{lane_classification: %{"lane" => lane}}) when is_atom(lane), do: Atom.to_string(lane)
+  defp issue_lane(_issue), do: nil
+
+  defp arg(args, key, default \\ nil) do
+    Map.get(args, key, Map.get(args, String.to_atom(key), default))
   end
 
   defp comment_payload(%{comment_id: comment_id}) when is_binary(comment_id), do: %{"comment_id" => comment_id}
@@ -458,6 +555,20 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:finalization_gate_blocked, result}) do
+    %{
+      "error" => %{
+        "message" => "Finalization gate blocked the Linear state transition.",
+        "code" => "finalization_gate_blocked",
+        "target_state" => Map.get(result, :target_state),
+        "final_state" => Map.get(result, :final_state),
+        "finalization_reason" => Map.get(result, :finalization_reason),
+        "protocol_violations" => Enum.map(Map.get(result, :protocol_violations, []), &violation_payload/1),
+        "protocol_warnings" => Enum.map(Map.get(result, :protocol_warnings, []), &violation_payload/1)
+      }
+    }
+  end
+
   defp tool_error_payload(:missing_linear_api_token) do
     %{
       "error" => %{
@@ -496,4 +607,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])
   end
+
+  defp violation_payload(violation) do
+    %{
+      "code" => violation.code |> to_string(),
+      "severity" => violation.severity |> to_string(),
+      "message" => violation.message,
+      "required_action" => violation.required_action,
+      "evidence" => stringify_keys(violation.evidence)
+    }
+  end
+
+  defp stringify_keys(map) when is_map(map), do: Map.new(map, fn {key, value} -> {to_string(key), stringify_keys(value)} end)
+  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  defp stringify_keys(value), do: value
 end

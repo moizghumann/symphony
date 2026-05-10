@@ -17,12 +17,11 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
 
   def evaluate(run_state, target_state, %Contract{} = contract) when is_map(run_state) do
     target_state = target_state_name(target_state, contract)
-    warnings = protocol_warnings(run_state)
+    warnings = protocol_warnings(run_state, contract)
 
     violations =
       []
       |> add_state_transition_violations(run_state, target_state, contract)
-      |> add_ticket_conflict_violations(run_state, contract)
       |> add_budget_violations(run_state, contract)
       |> add_validation_violations(run_state, target_state, contract)
       |> add_lane_violations(run_state, target_state, contract)
@@ -59,25 +58,6 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
 
   defp add_state_transition_violations(violations, run_state, target_state, contract) do
     StateTransitionGuard.validate(run_state, target_state, contract) ++ violations
-  end
-
-  defp add_ticket_conflict_violations(violations, run_state, %Contract{} = contract) do
-    if repo_changed?(run_state) and contract.repo_changes_require_pr and
-         !contract.allow_ticket_to_disable_pr and ticket_disables_pr?(run_state) do
-      [
-        Violation.blocking(:ticket_conflicts_with_workflow_policy, "Ticket text conflicts with the workflow PR policy.",
-          required_action: "Follow the workflow policy and require a PR for repository changes.",
-          evidence: %{
-            policy_override: true,
-            override_reason: "workflow requires PR for repo-changing tickets",
-            ticket_conflict: ticket_conflict(run_state)
-          }
-        )
-        | violations
-      ]
-    else
-      violations
-    end
   end
 
   defp add_budget_violations(violations, run_state, _contract) do
@@ -285,7 +265,29 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
     end
   end
 
-  defp protocol_warnings(run_state) do
+  defp protocol_warnings(run_state, %Contract{} = contract) do
+    policy_override_warnings(run_state, contract) ++ graphql_fallback_warnings(run_state)
+  end
+
+  defp policy_override_warnings(run_state, %Contract{} = contract) do
+    if repo_changed?(run_state) and contract.repo_changes_require_pr and
+         !contract.allow_ticket_to_disable_pr and ticket_disables_pr?(run_state) do
+      [
+        Violation.warning(:ticket_conflicts_with_workflow_policy, "Ticket text conflicts with the workflow PR policy.",
+          required_action: "Follow the workflow policy and require a PR for repository changes.",
+          evidence: %{
+            policy_override: true,
+            override_reason: "workflow requires PR for repo-changing tickets",
+            ticket_conflict: ticket_conflict(run_state)
+          }
+        )
+      ]
+    else
+      []
+    end
+  end
+
+  defp graphql_fallback_warnings(run_state) do
     run_state
     |> generic_linear_graphql_calls()
     |> Enum.flat_map(fn call ->
