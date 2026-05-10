@@ -65,6 +65,22 @@ defmodule SymphonyElixir.LaneClassifier do
         {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :research end)
         classification(:research, "matched explicit read-only research signal", matched_signals, 0.9)
 
+      feature_explicit?(text) and lane_matched?(matches, :feature) ->
+        {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :feature end)
+        classification(:feature, "matched explicit feature intent", matched_signals, 0.9)
+
+      refactor_explicit?(text) and lane_matched?(matches, :refactor) ->
+        {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :refactor end)
+        classification(:refactor, "matched explicit refactor intent", matched_signals, 0.9)
+
+      test_explicit?(text) and lane_matched?(matches, :test) ->
+        {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :test end)
+        classification(:test, "matched explicit test-writing intent", matched_signals, 0.9)
+
+      research_inquiry?(text, matches) ->
+        {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :research end)
+        classification(:research, "matched investigation inquiry signal", matched_signals, 0.85)
+
       match?([{_lane, _matched_signals}], matches) ->
         [{lane, matched_signals}] = matches
         classification(lane, "matched #{lane} signal", matched_signals, 0.8)
@@ -156,6 +172,33 @@ defmodule SymphonyElixir.LaneClassifier do
     signal_match?(text, "investigate") and
       (String.contains?(text, "read-only") or String.contains?(text, "no code changes") or
          String.contains?(text, "post findings"))
+  end
+
+  defp refactor_explicit?(text) when is_binary(text), do: signal_match?(text, "refactor")
+
+  defp feature_explicit?(text) when is_binary(text) do
+    signal_match?(text, "add") and
+      (signal_match?(text, "button") or signal_match?(text, "ui") or signal_match?(text, "endpoint") or signal_match?(text, "capability"))
+  end
+
+  defp test_explicit?(text) when is_binary(text) do
+    signal_match?(text, "test") or signal_match?(text, "tests") or signal_match?(text, "regression test")
+  end
+
+  defp research_inquiry?(text, matches) when is_binary(text) do
+    signal_match?(text, "investigate") and
+      (String.contains?(text, "investigate whether") or String.contains?(text, "investigate if")) and
+      lane_matched?(matches, :research) and
+      non_research_lanes(matches) -- [:docs] == []
+  end
+
+  defp lane_matched?(matches, lane), do: Enum.any?(matches, fn {matched_lane, _signals} -> matched_lane == lane end)
+
+  defp non_research_lanes(matches) do
+    matches
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.reject(&(&1 == :research))
+    |> Enum.uniq()
   end
 
   defp classification(lane, reason, matched_signals, confidence) do

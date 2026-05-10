@@ -8,11 +8,9 @@ tracker:
     - Merging
     - Rework
   terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
     - Done
+    - Duplicate
+    - Canceled
 polling:
   interval_ms: 5000
 workspace:
