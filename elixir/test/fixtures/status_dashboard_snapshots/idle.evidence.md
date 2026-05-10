@@ -9,7 +9,7 @@
 │ Next refresh: n/a
 ├─ Running
 │
-│   ID       STAGE          PID      AGE / TURN   EFFECTIVE  SESSION        EVENT
+│   ID       LANE     STAGE          PID      AGE / TURN   EFFECTIVE  BUDGET         SESSION        EVENT
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │  No active agents
 │

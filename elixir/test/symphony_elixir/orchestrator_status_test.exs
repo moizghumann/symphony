@@ -181,6 +181,93 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ]
   end
 
+  test "generic Linear GraphQL fallback records supplied reason and narrow helper metadata" do
+    issue_id = "issue-graphql-fallback"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-GQL",
+      title: "Fallback trace",
+      description: "Capture fallback metadata",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-GQL"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :GraphqlFallbackTraceOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-gql-turn-gql",
+      turn_count: 1,
+      tool_call_count: 0,
+      tool_call_counts: %{shell: 0, linear_narrow: 0, linear_generic_graphql: 0, github: 0, file_edit: 0, other: 0},
+      linear_generic_graphql_calls: 0,
+      linear_narrow_tool_calls: 0,
+      generic_graphql_fallback_reasons: [],
+      issue_state_transitions: [],
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _state ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :tool_call_completed,
+         timestamp: DateTime.utc_now(),
+         tool_name: "linear_graphql",
+         tool_arguments: %{
+           "query" => "mutation CustomLinearFallback { noop }",
+           "reason" => "narrow helper could not attach custom relation",
+           "operation" => "custom relation attach",
+           "narrow_tool_existed" => false,
+           "narrow_tool_failed" => true
+         },
+         tool_result: %{"success" => true}
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.tool_call_count == 1
+    assert snapshot_entry.tool_call_counts.linear_generic_graphql == 1
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 1_000)
+    [running] = payload.running
+
+    assert running.linear_lifecycle.generic_graphql_calls == 1
+
+    assert running.linear_lifecycle.generic_graphql_fallback_reasons == [
+             %{
+               reason: "narrow helper could not attach custom relation",
+               operation: "custom relation attach",
+               issue_identifier: "MT-GQL",
+               narrow_tool_existed: false,
+               narrow_tool_failed: true
+             }
+           ]
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -798,6 +885,234 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.total_tokens == 351_434
     assert completed_state.codex_totals.cached_input_tokens == 300_672
     assert completed_state.codex_totals.effective_tokens == 50_762
+  end
+
+  test "orchestrator blocks docs lane when hard effective token budget is exceeded" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-doc-budget"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "AGE-4",
+      title: "Update README",
+      description: "Docs-only ticket",
+      state: "In Progress",
+      labels: ["docs"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DocsBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :normal)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    ref = make_ref()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      lane: "docs",
+      classification_reason: "explicit label `docs`",
+      matched_signals: ["label:docs"],
+      policy_version: "2026-05-10.phase3",
+      effective_tokens_budget: 30_000,
+      effective_tokens_remaining: 30_000,
+      turn_budget: 3,
+      tool_call_budget: 12,
+      tool_call_count: 0,
+      tool_call_counts: %{shell: 0, linear_narrow: 0, linear_generic_graphql: 0, github: 0, file_edit: 0, other: 0},
+      linear_generic_graphql_calls: 0,
+      linear_narrow_tool_calls: 0,
+      generic_graphql_fallback_reasons: [],
+      issue_state_transitions: [],
+      handoff_comment_id: nil,
+      blocked_reason: nil,
+      budget_state: :ok,
+      finalization_reason: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_effective_tokens: 0,
+      codex_last_effective_token_delta: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_effective_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{
+                 "input_tokens" => 35_000,
+                 "cached_input_tokens" => 0,
+                 "output_tokens" => 1,
+                 "total_tokens" => 35_001
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}, 1_000
+    assert comment =~ "docs lane exceeded token budget before PR"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 1_000
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
+  test "orchestrator allows docs budget overrun to finish when handoff is already reviewable" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-doc-budget-ready"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "AGE-5",
+      title: "Update README",
+      description: "Docs-only ticket",
+      state: "In Progress",
+      labels: ["docs"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DocsBudgetHandoffReadyOrchestrator)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :normal)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      lane: "docs",
+      classification_reason: "explicit label `docs`",
+      matched_signals: ["label:docs"],
+      policy_version: "2026-05-10.phase3",
+      effective_tokens_budget: 30_000,
+      effective_tokens_remaining: 30_000,
+      turn_budget: 3,
+      tool_call_budget: 12,
+      tool_call_count: 0,
+      tool_call_counts: %{shell: 0, linear_narrow: 0, linear_generic_graphql: 0, github: 0, file_edit: 0, other: 0},
+      linear_generic_graphql_calls: 0,
+      linear_narrow_tool_calls: 0,
+      generic_graphql_fallback_reasons: [],
+      issue_state_transitions: [],
+      handoff_comment_id: nil,
+      blocked_reason: nil,
+      handoff_ready: true,
+      budget_state: :ok,
+      finalization_reason: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_effective_tokens: 0,
+      codex_last_effective_token_delta: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_effective_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{
+                 "input_tokens" => 35_000,
+                 "cached_input_tokens" => 0,
+                 "output_tokens" => 1,
+                 "total_tokens" => 35_001
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    refute_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 100
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.budget_state == :exceeded
+    assert snapshot_entry.finalization_reason == "docs lane exceeded token budget before PR"
   end
 
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
