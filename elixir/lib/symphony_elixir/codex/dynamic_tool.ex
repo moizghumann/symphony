@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Fallback only: execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Prefer the orchestrator-provided issue packet and narrow workflow helpers when available.
   """
   @linear_graphql_input_schema %{
     "type" => "object",

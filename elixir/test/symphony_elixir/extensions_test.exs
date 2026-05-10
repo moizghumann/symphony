@@ -317,6 +317,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+    )
+
+    issue = %Issue{
+      id: "issue-2",
+      available_states: [%{id: "state-human-review", name: "Human Review"}]
+    }
+
+    assert :ok = Adapter.move_issue_to_state(issue, "Human Review")
+
+    assert_receive {:graphql_called, direct_update_query, %{issueId: "issue-2", stateId: "state-human-review"}}
+
+    assert direct_update_query =~ "issueUpdate"
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
@@ -356,7 +372,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{
+                   "cached_input_tokens" => 0,
+                   "effective_delta_tokens" => 0,
+                   "effective_tokens" => 12,
+                   "input_tokens" => 4,
+                   "output_tokens" => 8,
+                   "total_tokens" => 12
+                 }
                }
              ],
              "retrying" => [
@@ -401,7 +424,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{
+                 "cached_input_tokens" => 0,
+                 "effective_delta_tokens" => 0,
+                 "effective_tokens" => 12,
+                 "input_tokens" => 4,
+                 "output_tokens" => 8,
+                 "total_tokens" => 12
+               }
              },
              "retry" => nil,
              "logs" => %{"codex_session_logs" => []},

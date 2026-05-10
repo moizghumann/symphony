@@ -110,8 +110,11 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
+        cached_input_tokens: Map.get(entry, :codex_cached_input_tokens, 0),
         output_tokens: entry.codex_output_tokens,
-        total_tokens: entry.codex_total_tokens
+        total_tokens: entry.codex_total_tokens,
+        effective_tokens: effective_tokens_from(entry),
+        effective_delta_tokens: Map.get(entry, :codex_last_effective_token_delta, 0)
       }
     }
   end
@@ -141,8 +144,11 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
+        cached_input_tokens: Map.get(running, :codex_cached_input_tokens, 0),
         output_tokens: running.codex_output_tokens,
-        total_tokens: running.codex_total_tokens
+        total_tokens: running.codex_total_tokens,
+        effective_tokens: effective_tokens_from(running),
+        effective_delta_tokens: Map.get(running, :codex_last_effective_token_delta, 0)
       }
     }
   end
@@ -180,6 +186,19 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp effective_tokens_from(entry) when is_map(entry) do
+    case Map.get(entry, :codex_effective_tokens) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      _ ->
+        input = Map.get(entry, :codex_input_tokens, 0)
+        cached = Map.get(entry, :codex_cached_input_tokens, 0)
+        output = Map.get(entry, :codex_output_tokens, 0)
+        max(input - cached + output, 0)
+    end
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

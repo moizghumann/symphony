@@ -92,10 +92,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
+            <p class="metric-label">Effective tokens</p>
+            <p class="metric-value numeric"><%= format_int(token_total(@payload.codex_totals, :effective_tokens)) %></p>
             <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
+              Gross context <%= format_int(token_total(@payload.codex_totals, :total_tokens)) %> / cached <%= format_int(token_total(@payload.codex_totals, :cached_input_tokens)) %>
             </p>
           </article>
 
@@ -195,8 +195,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td>
                       <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                        <span>Effective: <%= format_int(entry.tokens.effective_tokens) %></span>
+                        <span class="muted">Delta <%= format_int(entry.tokens.effective_delta_tokens) %> / gross <%= format_int(entry.tokens.total_tokens) %></span>
                       </div>
                     </td>
                   </tr>
@@ -308,6 +308,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_int(_value), do: "n/a"
+
+  defp token_total(tokens, key) when is_map(tokens) do
+    Map.get(tokens, key, 0)
+  end
+
+  defp token_total(_tokens, _key), do: 0
 
   defp state_badge_class(state) do
     base = "state-badge"

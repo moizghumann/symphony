@@ -19,7 +19,26 @@ defmodule SymphonyElixir.Linear.Client do
         description
         priority
         state {
+          id
           name
+        }
+        project {
+          id
+          name
+          slugId
+          url
+        }
+        team {
+          id
+          key
+          name
+          states(first: 100) {
+            nodes {
+              id
+              name
+              type
+            }
+          }
         }
         branchName
         url
@@ -64,7 +83,26 @@ defmodule SymphonyElixir.Linear.Client do
         description
         priority
         state {
+          id
           name
+        }
+        project {
+          id
+          name
+          slugId
+          url
+        }
+        team {
+          id
+          key
+          name
+          states(first: 100) {
+            nodes {
+              id
+              name
+              type
+            }
+          }
         }
         branchName
         url
@@ -455,8 +493,12 @@ defmodule SymphonyElixir.Linear.Client do
       description: issue["description"],
       priority: parse_priority(issue["priority"]),
       state: get_in(issue, ["state", "name"]),
+      state_id: get_in(issue, ["state", "id"]),
       branch_name: issue["branchName"],
       url: issue["url"],
+      project: normalize_project(issue["project"]),
+      team: normalize_team(issue["team"]),
+      available_states: extract_team_states(issue),
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
@@ -467,6 +509,27 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
+
+  defp normalize_project(%{} = project) do
+    %{
+      id: project["id"],
+      name: project["name"],
+      slug_id: project["slugId"],
+      url: project["url"]
+    }
+  end
+
+  defp normalize_project(_project), do: nil
+
+  defp normalize_team(%{} = team) do
+    %{
+      id: team["id"],
+      key: team["key"],
+      name: team["name"]
+    }
+  end
+
+  defp normalize_team(_team), do: nil
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
@@ -546,6 +609,25 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_labels(_), do: []
+
+  defp extract_team_states(%{"team" => %{"states" => %{"nodes" => states}}}) when is_list(states) do
+    states
+    |> Enum.flat_map(fn
+      %{"id" => id, "name" => name} = state when is_binary(id) and is_binary(name) ->
+        [
+          %{
+            id: id,
+            name: name,
+            type: state["type"]
+          }
+        ]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp extract_team_states(_issue), do: []
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do

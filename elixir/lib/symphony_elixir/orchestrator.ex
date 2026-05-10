@@ -16,8 +16,10 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
     input_tokens: 0,
+    cached_input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
+    effective_tokens: 0,
     seconds_running: 0
   }
 
@@ -660,7 +662,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case move_todo_issue_to_in_progress(refreshed_issue) do
+          {:ok, issue_for_dispatch} ->
+            do_dispatch_issue(state, issue_for_dispatch, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; failed to move issue to In Progress for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+
+            schedule_issue_retry(state, refreshed_issue.id, next_retry_attempt(attempt), %{
+              identifier: refreshed_issue.identifier,
+              error: "failed to move issue to In Progress: #{inspect(reason)}"
+            })
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -713,11 +726,16 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_event: nil,
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
+            codex_cached_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
+            codex_effective_tokens: 0,
+            codex_last_effective_token_delta: 0,
             codex_last_reported_input_tokens: 0,
+            codex_last_reported_cached_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_last_reported_effective_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -941,6 +959,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
   defp normalize_retry_attempt(_attempt), do: 0
 
+  defp next_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt + 1
+  defp next_retry_attempt(_attempt), do: nil
+
   defp next_retry_attempt_from_running(running_entry) do
     case Map.get(running_entry, :retry_attempt) do
       attempt when is_integer(attempt) and attempt > 0 -> attempt + 1
@@ -1054,6 +1075,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_entry_session_id(_running_entry), do: "n/a"
 
+  defp move_todo_issue_to_in_progress(%Issue{state: state_name} = issue) do
+    if normalize_issue_state(state_name) == "todo" do
+      case Tracker.move_issue_to_state(issue, "In Progress") do
+        :ok ->
+          {:ok, %{issue | state: "In Progress"}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
@@ -1115,8 +1150,11 @@ defmodule SymphonyElixir.Orchestrator do
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
+          codex_cached_input_tokens: Map.get(metadata, :codex_cached_input_tokens, 0),
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          codex_effective_tokens: Map.get(metadata, :codex_effective_tokens, 0),
+          codex_last_effective_token_delta: Map.get(metadata, :codex_last_effective_token_delta, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1172,12 +1210,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
+    codex_cached_input_tokens = Map.get(running_entry, :codex_cached_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    codex_effective_tokens = Map.get(running_entry, :codex_effective_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
+    last_reported_cached = Map.get(running_entry, :codex_last_reported_cached_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
+    last_reported_effective = Map.get(running_entry, :codex_last_reported_effective_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
@@ -1188,11 +1230,16 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
+        codex_cached_input_tokens: codex_cached_input_tokens + token_delta.cached_input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_effective_tokens: codex_effective_tokens + token_delta.effective_tokens,
+        codex_last_effective_token_delta: token_delta.effective_tokens,
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
+        codex_last_reported_cached_input_tokens: max(last_reported_cached, token_delta.cached_input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_reported_effective_tokens: max(last_reported_effective, token_delta.effective_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1282,8 +1329,10 @@ defmodule SymphonyElixir.Orchestrator do
         state.codex_totals,
         %{
           input_tokens: 0,
+          cached_input_tokens: 0,
           output_tokens: 0,
           total_tokens: 0,
+          effective_tokens: 0,
           seconds_running: runtime_seconds
         }
       )
@@ -1314,9 +1363,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(
          %{codex_totals: codex_totals} = state,
-         %{input_tokens: input, output_tokens: output, total_tokens: total} = token_delta
+         %{input_tokens: input, output_tokens: output, total_tokens: total, effective_tokens: effective} = token_delta
        )
-       when is_integer(input) and is_integer(output) and is_integer(total) do
+       when is_integer(input) and is_integer(output) and is_integer(total) and is_integer(effective) do
     %{state | codex_totals: apply_token_delta(codex_totals, token_delta)}
   end
 
@@ -1336,16 +1385,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
+    cached_input_tokens = Map.get(codex_totals, :cached_input_tokens, 0) + Map.get(token_delta, :cached_input_tokens, 0)
     output_tokens = Map.get(codex_totals, :output_tokens, 0) + token_delta.output_tokens
     total_tokens = Map.get(codex_totals, :total_tokens, 0) + token_delta.total_tokens
+    effective_tokens = Map.get(codex_totals, :effective_tokens, 0) + Map.get(token_delta, :effective_tokens, 0)
 
     seconds_running =
       Map.get(codex_totals, :seconds_running, 0) + Map.get(token_delta, :seconds_running, 0)
 
     %{
       input_tokens: max(0, input_tokens),
+      cached_input_tokens: max(0, cached_input_tokens),
       output_tokens: max(0, output_tokens),
       total_tokens: max(0, total_tokens),
+      effective_tokens: max(0, effective_tokens),
       seconds_running: max(0, seconds_running)
     }
   end
@@ -1363,6 +1416,12 @@ defmodule SymphonyElixir.Orchestrator do
       ),
       compute_token_delta(
         running_entry,
+        :cached_input,
+        usage,
+        :codex_last_reported_cached_input_tokens
+      ),
+      compute_token_delta(
+        running_entry,
         :output,
         usage,
         :codex_last_reported_output_tokens
@@ -1372,17 +1431,26 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         usage,
         :codex_last_reported_total_tokens
+      ),
+      compute_effective_token_delta(
+        running_entry,
+        usage,
+        :codex_last_reported_effective_tokens
       )
     }
     |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
+    |> then(fn [input, cached_input, output, total, effective] ->
       %{
         input_tokens: input.delta,
+        cached_input_tokens: cached_input.delta,
         output_tokens: output.delta,
         total_tokens: total.delta,
+        effective_tokens: effective.delta,
         input_reported: input.reported,
+        cached_input_reported: cached_input.reported,
         output_reported: output.reported,
-        total_reported: total.reported
+        total_reported: total.reported,
+        effective_reported: effective.reported
       }
     end)
   end
@@ -1403,6 +1471,35 @@ defmodule SymphonyElixir.Orchestrator do
       reported: if(is_integer(next_total), do: next_total, else: prev_reported)
     }
   end
+
+  defp compute_effective_token_delta(running_entry, usage, reported_key) do
+    next_total = effective_token_usage(usage)
+    prev_reported = Map.get(running_entry, reported_key, 0)
+
+    delta =
+      if is_integer(next_total) and next_total >= prev_reported do
+        next_total - prev_reported
+      else
+        0
+      end
+
+    %{
+      delta: max(delta, 0),
+      reported: if(is_integer(next_total), do: next_total, else: prev_reported)
+    }
+  end
+
+  defp effective_token_usage(usage) when is_map(usage) do
+    input = get_token_usage(usage, :input)
+    cached = get_token_usage(usage, :cached_input) || 0
+    output = get_token_usage(usage, :output)
+
+    if is_integer(input) and is_integer(output) do
+      max(input - cached + output, 0)
+    end
+  end
+
+  defp effective_token_usage(_usage), do: nil
 
   defp extract_token_usage(update) do
     payloads = [
@@ -1553,21 +1650,25 @@ defmodule SymphonyElixir.Orchestrator do
   defp integer_token_map?(payload) do
     token_fields = [
       :input_tokens,
+      :cached_input_tokens,
       :output_tokens,
       :total_tokens,
       :prompt_tokens,
       :completion_tokens,
       :inputTokens,
+      :cachedInputTokens,
       :outputTokens,
       :totalTokens,
       :promptTokens,
       :completionTokens,
       "input_tokens",
+      "cached_input_tokens",
       "output_tokens",
       "total_tokens",
       "prompt_tokens",
       "completion_tokens",
       "inputTokens",
+      "cachedInputTokens",
       "outputTokens",
       "totalTokens",
       "promptTokens",
@@ -1593,6 +1694,21 @@ defmodule SymphonyElixir.Orchestrator do
         :promptTokens,
         "inputTokens",
         :inputTokens
+      ])
+
+  defp get_token_usage(usage, :cached_input),
+    do:
+      payload_get(usage, [
+        "cached_input_tokens",
+        :cached_input_tokens,
+        "cachedInputTokens",
+        :cachedInputTokens,
+        "input_cached_tokens",
+        :input_cached_tokens,
+        "cache_read_input_tokens",
+        :cache_read_input_tokens,
+        "cached_tokens",
+        :cached_tokens
       ])
 
   defp get_token_usage(usage, :output),

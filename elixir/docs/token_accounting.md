@@ -15,6 +15,8 @@ It is based on the current Codex source in `codex-rs`, especially:
 
 - `last_token_usage` means "the latest increment".
 - `total_token_usage` means "the cumulative total so far".
+- `total_tokens` is gross context usage and can include cached input replay.
+- `effective_tokens = input_tokens - cached_input_tokens + output_tokens`; use this as the primary operational spend/pressure metric.
 - `thread/tokenUsage/updated` is the live streaming notification for token usage.
 - `turn/completed` carries final turn state, and turn-level usage is exposed separately from the live thread token stream.
 - Generic `usage` fields are event-specific. Do not assume every `usage` payload is a cumulative thread total.
@@ -210,6 +212,8 @@ For each thread, keep:
 
 - `absolute_total`: latest accepted absolute total snapshot
 - `accumulated_total`: the total you expose in UI/API
+- `cached_input_total`: latest accepted cached input snapshot
+- `effective_total`: `input - cached input + output`
 - `last_seen_turn_id`
 
 ### Preferred source order
@@ -234,7 +238,8 @@ Do not treat generic `params.usage` as equivalent to a cumulative thread total u
 
 - Treat it as a thread-level snapshot.
 - If it is greater than or equal to the stored `absolute_total`, replace the stored absolute total.
-- Set exposed totals from that absolute snapshot.
+- Set exposed gross totals and cached input totals from that absolute snapshot.
+- Compute exposed effective totals from the same snapshot.
 - Do not add the corresponding delta again.
 
 #### If no absolute total is present
@@ -252,6 +257,8 @@ If you misclassify a per-turn `usage` payload as an absolute thread total, later
 
 - Prefer `thread/tokenUsage/updated` for live reporting.
 - Treat `tokenUsage.total` as authoritative for thread totals.
+- Label raw `total_tokens` as gross context tokens when displaying it.
+- Show cached input and effective tokens separately.
 - Key accounting by `thread_id`, not just issue id.
 - Expect one thread to span multiple turns when Symphony reuses a live Codex thread.
 

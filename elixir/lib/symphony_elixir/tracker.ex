@@ -10,6 +10,9 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback move_issue_to_state(term(), String.t()) :: :ok | {:error, term()}
+  @callback move_issue_to_blocked(term()) :: :ok | {:error, term()}
+  @callback post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -34,6 +37,21 @@ defmodule SymphonyElixir.Tracker do
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     adapter().update_issue_state(issue_id, state_name)
+  end
+
+  @spec move_issue_to_state(term(), String.t()) :: :ok | {:error, term()}
+  def move_issue_to_state(issue_or_id, state_name) do
+    adapter().move_issue_to_state(issue_or_id, state_name)
+  end
+
+  @spec move_issue_to_blocked(term()) :: :ok | {:error, term()}
+  def move_issue_to_blocked(issue_or_id) do
+    adapter().move_issue_to_blocked(issue_or_id)
+  end
+
+  @spec post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
+  def post_handoff_comment(issue_or_id, body) do
+    adapter().post_handoff_comment(issue_or_id, body)
   end
 
   @spec adapter() :: module()
