@@ -30,6 +30,35 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  defmodule HandoffCommentIdLinearClient do
+    def fetch_candidate_issues, do: {:ok, []}
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(query, variables) do
+      case Application.get_env(:symphony_elixir, :linear_client_recipient) do
+        pid when is_pid(pid) -> send(pid, {:linear_client_graphql, query, variables})
+        _ -> :ok
+      end
+
+      cond do
+        String.contains?(query, "commentCreate") ->
+          {:ok,
+           %{
+             "data" => %{
+               "commentCreate" => %{
+                 "success" => true,
+                 "comment" => %{"id" => "comment-249"}
+               }
+             }
+           }}
+
+        String.contains?(query, "issueUpdate") ->
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -1097,19 +1126,14 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
+    assert prompt =~ "You are working on Linear issue `MT-616`"
+    assert prompt =~ "Symphony lane-specific job packet"
+    assert prompt =~ "\"lane\": \"docs\""
+    assert prompt =~ "\"classification_reason\": \"matched docs signal\""
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "Continuation context:"
-    assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Follow the lane policy exactly"
+    assert prompt =~ "Codex owns repository work only"
+    assert prompt =~ "Continuation attempt #2"
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -1155,7 +1179,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "\"project\":{\"id\":\"project-1\",\"name\":\"Symphony\"}"
     assert prompt =~ "\"team\":{\"id\":\"team-1\",\"key\":\"MT\"}"
     assert prompt =~ "\"state_ids\":{\"Human Review\":\"state-review\",\"In Progress\":\"state-progress\",\"Todo\":\"state-todo\"}"
-    assert prompt =~ "Do not use generic Linear GraphQL to rediscover"
+    assert prompt =~ "Do not call generic Linear GraphQL for normal lifecycle actions"
+    assert prompt =~ "In the normal repo-changing happy path, do not call handoff or Human Review helpers"
+    assert prompt =~ "Research lane is the exception"
+    assert prompt =~ "Narrow Linear helpers are available for supported fallback/runtime lifecycle operations"
     assert prompt =~ "SYMPHONY_HANDOFF_READY"
   end
 
@@ -1859,14 +1886,17 @@ defmodule SymphonyElixir.CoreTest do
       System.put_env("GH_LOG", gh_log)
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        tracker_kind: "memory",
+        tracker_kind: "linear",
         workspace_root: workspace_root,
         hook_after_create: "git clone #{origin} .",
         codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )
 
-      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+      Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
       parent = self()
 
       state_fetcher = fn [_issue_id] ->
@@ -1878,7 +1908,16 @@ defmodule SymphonyElixir.CoreTest do
         end
 
         send(parent, {:handoff_state_fetch, attempt, "In Progress"})
-        {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "In Progress"}]}
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-terminal-handoff",
+             identifier: "MT-249",
+             state: "In Progress",
+             available_states: [%{id: "state-human-review", name: "Human Review"}]
+           }
+         ]}
       end
 
       issue = %Issue{
@@ -1886,16 +1925,150 @@ defmodule SymphonyElixir.CoreTest do
         identifier: "MT-249",
         title: "Hand off after Codex completion signal",
         description: "Repo changes should publish after Codex signals completion",
-        state: "In Progress"
+        state: "In Progress",
+        available_states: [%{id: "state-human-review", name: "Human Review"}]
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
       assert_receive {:handoff_state_fetch, 1, "In Progress"}
       refute_receive {:handoff_state_fetch, 2, _state}
       assert File.read!(gh_log) =~ "pr create --draft --head symphony/mt-249 --base main"
-      assert_receive {:memory_tracker_comment, "issue-terminal-handoff", comment}
+
+      assert_receive {:linear_client_graphql, comment_query, %{issueId: "issue-terminal-handoff", body: comment}}
+      assert comment_query =~ "commentCreate"
       assert comment =~ "https://github.com/example/repo/pull/249"
-      assert_receive {:memory_tracker_state_update, "issue-terminal-handoff", "Human Review"}
+
+      assert_receive {:codex_worker_update, "issue-terminal-handoff",
+                      %{
+                        event: :linear_lifecycle_call,
+                        tool_name: "linear_post_handoff",
+                        tool_result: %{"success" => true, "comment_id" => "comment-249"}
+                      }}
+
+      assert_receive {:linear_client_graphql, update_query, %{issueId: "issue-terminal-handoff", stateId: "state-human-review"}}
+
+      assert update_query =~ "issueUpdate"
+
+      assert_receive {:codex_worker_update, "issue-terminal-handoff",
+                      %{
+                        event: :linear_lifecycle_call,
+                        tool_name: "linear_move_to_human_review",
+                        tool_result: %{"success" => true}
+                      }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "research lane completes through narrow Linear handoff without repo marker or PR" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-research-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-research"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research"}}}'
+            printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff","body":"README onboarding is clear; no repo changes needed."}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":202,"method":"item/tool/call","params":{"name":"linear_move_to_human_review","callId":"call-review","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff"}}}'
+            ;;
+          6)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "linear",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+      Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
+      issue = %Issue{
+        id: "issue-research-handoff",
+        identifier: "MT-RESEARCH",
+        title: "Investigate README onboarding clarity",
+        description: "Read-only review. Post findings in Linear. No code changes.",
+        state: "In Progress",
+        labels: ["research"],
+        lane_classification: %{
+          lane: :research,
+          reason: "explicit label `research`",
+          matched_signals: ["label:research"],
+          policy_version: "2026-05-10.phase3"
+        },
+        available_states: [%{id: "state-human-review", name: "Human Review"}]
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, self(),
+                 linear_lifecycle_graphql: &HandoffCommentIdLinearClient.graphql/2,
+                 issue_state_fetcher: fn _issue_ids ->
+                   flunk("research lane should not poll for continuation after narrow handoff")
+                 end
+               )
+
+      trace = File.read!(trace_file)
+      refute trace =~ "codex/event/agent_message_content_delta"
+
+      assert_receive {:linear_client_graphql, comment_query, %{issueId: "issue-research-handoff", body: comment}}
+      assert comment_query =~ "commentCreate"
+      assert comment =~ "README onboarding is clear"
+
+      assert_receive {:linear_client_graphql, update_query, %{issueId: "issue-research-handoff", stateId: "state-human-review"}}
+
+      assert update_query =~ "issueUpdate"
+
+      assert_receive {:codex_worker_update, "issue-research-handoff",
+                      %{
+                        event: :tool_call_completed,
+                        tool_name: "linear_post_handoff",
+                        tool_result: %{"success" => true}
+                      }}
+
+      assert_receive {:codex_worker_update, "issue-research-handoff",
+                      %{
+                        event: :tool_call_completed,
+                        tool_name: "linear_move_to_human_review",
+                        tool_result: %{"success" => true}
+                      }}
     after
       File.rm_rf(test_root)
     end

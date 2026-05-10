@@ -62,6 +62,13 @@ defmodule SymphonyElixir.Tracker.Memory do
     create_comment(issue_id(issue_or_id), body)
   end
 
+  @spec post_handoff_comment_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
+  def post_handoff_comment_result(issue_or_id, body) do
+    with :ok <- post_handoff_comment(issue_or_id, body) do
+      {:ok, %{}}
+    end
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

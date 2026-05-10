@@ -85,7 +85,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+        DynamicTool.execute(tool, arguments,
+          issue: issue,
+          linear_lifecycle_graphql: Keyword.get(opts, :linear_lifecycle_graphql)
+        )
       end)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -582,8 +585,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         payload: payload,
         raw: payload_string,
         tool_name: tool_name,
-        arguments: arguments,
-        result: result
+        tool_arguments: arguments,
+        tool_result: result
       },
       metadata
     )

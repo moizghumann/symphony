@@ -16,6 +16,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
   @running_id_width 8
+  @running_lane_width 8
   @running_stage_width 14
   @running_pid_width 8
   @running_age_width 12
@@ -23,7 +24,8 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_session_width 14
   @running_event_default_width 44
   @running_event_min_width 12
-  @running_row_chrome_width 10
+  @running_budget_width 14
+  @running_row_chrome_width 12
   @default_terminal_columns 115
 
   @ansi_reset IO.ANSI.reset()
@@ -596,6 +598,7 @@ defmodule SymphonyElixir.StatusDashboard do
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
+    lane = format_cell(Map.get(running_entry, :lane) || "unknown", @running_lane_width)
     state = running_entry.state || "unknown"
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
@@ -608,21 +611,25 @@ defmodule SymphonyElixir.StatusDashboard do
     event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
 
     tokens = format_count(effective_tokens) |> format_cell(@running_tokens_width, :right)
+    budget = format_cell(format_budget(running_entry), @running_budget_width)
 
     status_color =
-      case event do
-        :none -> @ansi_red
-        "codex/event/token_count" -> @ansi_yellow
-        "codex/event/task_started" -> @ansi_green
-        "turn_completed" -> @ansi_magenta
-        _ -> @ansi_blue
-      end
+      budget_color(running_entry) ||
+        case event do
+          :none -> @ansi_red
+          "codex/event/token_count" -> @ansi_yellow
+          "codex/event/task_started" -> @ansi_green
+          "turn_completed" -> @ansi_magenta
+          _ -> @ansi_blue
+        end
 
     [
       "│ ",
       status_dot(status_color),
       " ",
       colorize(issue, @ansi_cyan),
+      " ",
+      colorize(lane, @ansi_magenta),
       " ",
       colorize(state_display, status_color),
       " ",
@@ -631,6 +638,8 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize(age, @ansi_magenta),
       " ",
       colorize(tokens, @ansi_yellow),
+      " ",
+      colorize(budget, budget_color(running_entry) || @ansi_gray),
       " ",
       colorize(session, @ansi_cyan),
       " ",
@@ -723,6 +732,36 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_runtime_and_turns(seconds, _turn_count), do: format_runtime_seconds(seconds)
 
+  defp format_budget(running_entry) when is_map(running_entry) do
+    state = Map.get(running_entry, :budget_state, :ok)
+    effective = Map.get(running_entry, :codex_effective_tokens, 0)
+    budget = Map.get(running_entry, :effective_tokens_budget)
+    tools = Map.get(running_entry, :tool_call_count, 0)
+    tool_budget = Map.get(running_entry, :tool_call_budget)
+
+    token_part =
+      if is_integer(budget) do
+        "#{format_count(effective)}/#{format_count(budget)}"
+      else
+        format_count(effective)
+      end
+
+    tool_part =
+      if is_integer(tool_budget) do
+        " tools #{tools}/#{tool_budget}"
+      else
+        ""
+      end
+
+    "#{state} #{token_part}#{tool_part}"
+  end
+
+  defp budget_color(%{budget_state: :exceeded}), do: @ansi_red
+  defp budget_color(%{budget_state: "exceeded"}), do: @ansi_red
+  defp budget_color(%{budget_state: :warning}), do: @ansi_yellow
+  defp budget_color(%{budget_state: "warning"}), do: @ansi_yellow
+  defp budget_color(_running_entry), do: nil
+
   defp format_count(nil), do: "0"
 
   defp format_count(value) when is_integer(value) do
@@ -747,10 +786,12 @@ defmodule SymphonyElixir.StatusDashboard do
     header =
       [
         format_cell("ID", @running_id_width),
+        format_cell("LANE", @running_lane_width),
         format_cell("STAGE", @running_stage_width),
         format_cell("PID", @running_pid_width),
         format_cell("AGE / TURN", @running_age_width),
         format_cell("EFFECTIVE", @running_tokens_width),
+        format_cell("BUDGET", @running_budget_width),
         format_cell("SESSION", @running_session_width),
         format_cell("EVENT", running_event_width)
       ]
@@ -763,12 +804,14 @@ defmodule SymphonyElixir.StatusDashboard do
   defp running_table_separator_row(running_event_width) do
     separator_width =
       @running_id_width +
+        @running_lane_width +
         @running_stage_width +
         @running_pid_width +
         @running_age_width +
         @running_tokens_width +
+        @running_budget_width +
         @running_session_width +
-        running_event_width + 6
+        running_event_width + 8
 
     "│   " <> colorize(String.duplicate("─", separator_width), @ansi_gray)
   end
@@ -784,10 +827,12 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp fixed_running_width do
     @running_id_width +
+      @running_lane_width +
       @running_stage_width +
       @running_pid_width +
       @running_age_width +
       @running_tokens_width +
+      @running_budget_width +
       @running_session_width
   end
 

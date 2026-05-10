@@ -289,8 +289,14 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
     run_state
     |> generic_linear_graphql_calls()
     |> Enum.flat_map(fn call ->
-      reason = Map.get(call, :fallback_reason) || Map.get(call, "fallback_reason")
-      narrow_available = Map.get(call, :narrow_tool_available) || Map.get(call, "narrow_tool_available")
+      reason = Map.get(call, :fallback_reason) || Map.get(call, "fallback_reason") || Map.get(call, :reason) || Map.get(call, "reason")
+
+      narrow_available =
+        Map.get(call, :narrow_tool_available) ||
+          Map.get(call, "narrow_tool_available") ||
+          Map.get(call, :narrow_tool_existed) ||
+          Map.get(call, "narrow_tool_existed")
+
       narrow_failed = Map.get(call, :narrow_tool_failed) || Map.get(call, "narrow_tool_failed")
 
       cond do
@@ -539,7 +545,23 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
     case Map.get(run_state, :generic_linear_graphql_calls) || Map.get(run_state, "generic_linear_graphql_calls") do
       calls when is_list(calls) -> calls
       true -> [%{}]
-      _ -> []
+      _ -> linear_graphql_call_count_entries(run_state)
+    end
+  end
+
+  defp linear_graphql_call_count_entries(run_state) do
+    count = Map.get(run_state, :linear_generic_graphql_calls) || Map.get(run_state, "linear_generic_graphql_calls")
+    reasons = Map.get(run_state, :generic_graphql_fallback_reasons) || Map.get(run_state, "generic_graphql_fallback_reasons") || []
+
+    cond do
+      is_integer(count) and count > 0 and reasons == [] ->
+        Enum.map(1..count, fn _ -> %{} end)
+
+      is_integer(count) and count > 0 ->
+        Enum.map(reasons, fn reason -> %{reason: reason} end)
+
+      true ->
+        []
     end
   end
 

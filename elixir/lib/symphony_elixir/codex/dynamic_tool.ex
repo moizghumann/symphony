@@ -3,9 +3,27 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, Issue, Lifecycle}
 
   @linear_graphql_tool "linear_graphql"
+  @linear_move_state_tool "linear_move_state"
+  @linear_move_to_in_progress_tool "linear_move_to_in_progress"
+  @linear_move_to_human_review_tool "linear_move_to_human_review"
+  @linear_move_to_blocked_tool "linear_move_to_blocked"
+  @linear_post_comment_tool "linear_post_comment"
+  @linear_post_handoff_tool "linear_post_handoff"
+  @linear_post_blocker_tool "linear_post_blocker"
+  @linear_attach_pr_tool "linear_attach_pr"
+  @linear_narrow_tools [
+    @linear_move_state_tool,
+    @linear_move_to_in_progress_tool,
+    @linear_move_to_human_review_tool,
+    @linear_move_to_blocked_tool,
+    @linear_post_comment_tool,
+    @linear_post_handoff_tool,
+    @linear_post_blocker_tool,
+    @linear_attach_pr_tool
+  ]
   @linear_graphql_description """
   Fallback only: execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
   Prefer the orchestrator-provided issue packet and narrow workflow helpers when available.
@@ -24,23 +42,66 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "description" => "Optional GraphQL variables object.",
         "additionalProperties" => true
       },
+      "reason" => %{
+        "type" => ["string", "null"],
+        "description" => "Required in practice: why a narrow Linear helper was insufficient."
+      },
       "fallback_reason" => %{
         "type" => ["string", "null"],
-        "description" => "Why a narrow Symphony helper or issue packet was insufficient for this operation."
+        "description" => "Alias for reason: why generic Linear GraphQL fallback was necessary."
       },
       "operation" => %{
         "type" => ["string", "null"],
-        "description" => "Short name for the Linear operation being performed."
+        "description" => "Short label for the fallback operation."
+      },
+      "narrow_tool_existed" => %{
+        "type" => ["boolean", "null"],
+        "description" => "Whether a narrow helper existed for the intended operation."
       },
       "narrow_tool_available" => %{
         "type" => ["boolean", "null"],
-        "description" => "Whether a narrow Symphony helper existed for this operation."
+        "description" => "Alias for narrow_tool_existed."
       },
       "narrow_tool_failed" => %{
         "type" => ["boolean", "null"],
-        "description" => "Whether the narrow helper was attempted and failed before falling back."
+        "description" => "Whether the narrow helper was attempted and failed first."
       }
     }
+  }
+  @issue_id_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["issue_id"],
+    "properties" => %{
+      "issue_id" => %{"type" => "string", "description" => "Resolved Linear issue id from the issue packet."}
+    }
+  }
+  @move_state_schema %{
+    @issue_id_schema
+    | "required" => ["issue_id", "state_name"],
+      "properties" =>
+        Map.put(@issue_id_schema["properties"], "state_name", %{
+          "type" => "string",
+          "description" => "Target Linear workflow state name."
+        })
+  }
+  @comment_schema %{
+    @issue_id_schema
+    | "required" => ["issue_id", "body"],
+      "properties" =>
+        Map.put(@issue_id_schema["properties"], "body", %{
+          "type" => "string",
+          "description" => "Concise Linear comment body."
+        })
+  }
+  @attach_pr_schema %{
+    @issue_id_schema
+    | "required" => ["issue_id", "pr_url"],
+      "properties" =>
+        Map.put(@issue_id_schema["properties"], "pr_url", %{
+          "type" => "string",
+          "description" => "Draft GitHub PR URL to record on the issue."
+        })
   }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
@@ -48,6 +109,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
+
+      tool when tool in @linear_narrow_tools ->
+        execute_linear_lifecycle(tool, arguments, opts)
 
       other ->
         failure_response(%{
@@ -63,12 +127,58 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   def tool_specs do
     [
       %{
+        "name" => @linear_move_state_tool,
+        "description" => "Move the current Linear issue to a named state using the resolved state map.",
+        "inputSchema" => @move_state_schema
+      },
+      %{
+        "name" => @linear_move_to_in_progress_tool,
+        "description" => "Move the current Linear issue to In Progress using the resolved state map.",
+        "inputSchema" => @issue_id_schema
+      },
+      %{
+        "name" => @linear_move_to_human_review_tool,
+        "description" => "Move the current Linear issue to Human Review using the resolved state map.",
+        "inputSchema" => @issue_id_schema
+      },
+      %{
+        "name" => @linear_move_to_blocked_tool,
+        "description" => "Move the current Linear issue to Blocked using the resolved state map.",
+        "inputSchema" => @issue_id_schema
+      },
+      %{
+        "name" => @linear_post_comment_tool,
+        "description" => "Post a concise Linear comment to the current issue.",
+        "inputSchema" => @comment_schema
+      },
+      %{
+        "name" => @linear_post_handoff_tool,
+        "description" => "Post the final handoff comment to the current Linear issue.",
+        "inputSchema" => @comment_schema
+      },
+      %{
+        "name" => @linear_post_blocker_tool,
+        "description" => "Post a blocker comment to the current Linear issue.",
+        "inputSchema" => @comment_schema
+      },
+      %{
+        "name" => @linear_attach_pr_tool,
+        "description" => "Record a draft PR URL on the current Linear issue.",
+        "inputSchema" => @attach_pr_schema
+      },
+      %{
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
       }
     ]
   end
+
+  @spec linear_graphql_tool_name() :: String.t()
+  def linear_graphql_tool_name, do: @linear_graphql_tool
+
+  @spec linear_narrow_tool_names() :: [String.t()]
+  def linear_narrow_tool_names, do: @linear_narrow_tools
 
   defp execute_linear_graphql(arguments, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
@@ -79,6 +189,112 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_linear_lifecycle(tool, arguments, opts) do
+    with {:ok, args} <- normalize_object_arguments(arguments),
+         {:ok, issue} <- current_issue(opts),
+         :ok <- validate_issue_id(issue, args),
+         {:ok, payload} <- run_linear_lifecycle_tool(tool, issue, args, opts) do
+      success_response(Map.merge(%{"tool" => tool, "issue_id" => issue.id}, payload))
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_move_state_tool, issue, args, opts) do
+    with {:ok, state_name} <- required_string(args, "state_name"),
+         :ok <- Lifecycle.move_state(issue, state_name, lifecycle_opts(opts)) do
+      {:ok, %{"state" => state_name}}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_move_to_in_progress_tool, issue, _args, opts) do
+    with :ok <- Lifecycle.move_to_in_progress(issue, lifecycle_opts(opts)) do
+      {:ok, %{"state" => "In Progress"}}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_move_to_human_review_tool, issue, _args, opts) do
+    with :ok <- Lifecycle.move_to_human_review(issue, lifecycle_opts(opts)) do
+      {:ok, %{"state" => "Human Review"}}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_move_to_blocked_tool, issue, _args, opts) do
+    with :ok <- Lifecycle.move_to_blocked(issue, lifecycle_opts(opts)) do
+      {:ok, %{"state" => "Blocked"}}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_post_comment_tool, issue, args, opts) do
+    with {:ok, body} <- required_string(args, "body"),
+         {:ok, payload} <- Lifecycle.post_comment(issue, body, lifecycle_opts(opts)) do
+      {:ok, comment_payload(payload)}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_post_handoff_tool, issue, args, opts) do
+    with {:ok, body} <- required_string(args, "body"),
+         {:ok, payload} <- Lifecycle.post_handoff(issue, body, lifecycle_opts(opts)) do
+      {:ok, comment_payload(payload)}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_post_blocker_tool, issue, args, opts) do
+    with {:ok, body} <- required_string(args, "body"),
+         {:ok, payload} <- Lifecycle.post_blocker(issue, body, lifecycle_opts(opts)) do
+      {:ok, comment_payload(payload)}
+    end
+  end
+
+  defp run_linear_lifecycle_tool(@linear_attach_pr_tool, issue, args, opts) do
+    with {:ok, pr_url} <- required_string(args, "pr_url"),
+         {:ok, payload} <- Lifecycle.attach_pr(issue, pr_url, lifecycle_opts(opts)) do
+      {:ok, Map.merge(comment_payload(payload), %{"pr_url" => pr_url})}
+    end
+  end
+
+  defp lifecycle_opts(opts) do
+    case Keyword.get(opts, :linear_lifecycle_graphql) do
+      fun when is_function(fun, 2) -> [graphql: fun]
+      _ -> []
+    end
+  end
+
+  defp comment_payload(%{comment_id: comment_id}) when is_binary(comment_id), do: %{"comment_id" => comment_id}
+  defp comment_payload(_payload), do: %{}
+
+  defp normalize_object_arguments(arguments) when is_map(arguments), do: {:ok, arguments}
+  defp normalize_object_arguments(_arguments), do: {:error, :invalid_lifecycle_arguments}
+
+  defp current_issue(opts) do
+    case Keyword.get(opts, :issue) do
+      %Issue{id: issue_id} = issue when is_binary(issue_id) and issue_id != "" -> {:ok, issue}
+      _ -> {:error, :missing_issue_context}
+    end
+  end
+
+  defp validate_issue_id(%Issue{id: issue_id}, args) do
+    case Map.get(args, "issue_id") || Map.get(args, :issue_id) do
+      ^issue_id -> :ok
+      value when is_binary(value) -> {:error, {:issue_id_mismatch, requested_issue_id: value, current_issue_id: issue_id}}
+      _ -> {:error, :missing_issue_id}
+    end
+  end
+
+  defp required_string(args, key) do
+    case Map.get(args, key) || Map.get(args, String.to_atom(key)) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> {:error, {:missing_required_argument, key}}
+          trimmed -> {:ok, trimmed}
+        end
+
+      _ ->
+        {:error, {:missing_required_argument, key}}
     end
   end
 
@@ -142,6 +358,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     dynamic_tool_response(false, encode_payload(payload))
   end
 
+  defp success_response(payload) do
+    dynamic_tool_response(true, encode_payload(payload))
+  end
+
   defp dynamic_tool_response(success, output) when is_boolean(success) and is_binary(output) do
     %{
       "success" => success,
@@ -181,6 +401,59 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_lifecycle_arguments) do
+    %{
+      "error" => %{
+        "message" => "Linear lifecycle tools require a JSON object argument."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_context) do
+    %{
+      "error" => %{
+        "message" => "Linear lifecycle tool execution requires Symphony's resolved issue context."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_id) do
+    %{
+      "error" => %{
+        "message" => "Linear lifecycle tools require the resolved `issue_id` from the issue packet."
+      }
+    }
+  end
+
+  defp tool_error_payload({:missing_required_argument, argument}) do
+    %{
+      "error" => %{
+        "message" => "Linear lifecycle tool missing required argument `#{argument}`."
+      }
+    }
+  end
+
+  defp tool_error_payload({:issue_id_mismatch, details}) do
+    %{
+      "error" =>
+        Map.merge(
+          %{"message" => "Linear lifecycle tools can only operate on the current issue."},
+          Map.new(details, fn {key, value} -> {to_string(key), value} end)
+        )
+    }
+  end
+
+  defp tool_error_payload(%{code: "state_not_found"} = details) do
+    %{
+      "error" => %{
+        "message" => "Requested Linear state was not found in the resolved state map.",
+        "code" => "state_not_found",
+        "requested_state" => details.requested_state,
+        "available_states" => details.available_states
       }
     }
   end
