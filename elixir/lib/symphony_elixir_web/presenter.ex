@@ -115,6 +115,14 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens,
         effective_tokens: effective_tokens_from(entry),
         effective_delta_tokens: Map.get(entry, :codex_last_effective_token_delta, 0)
+      },
+      linear_lifecycle: %{
+        generic_graphql_calls: Map.get(entry, :linear_generic_graphql_calls, 0),
+        narrow_tool_calls: Map.get(entry, :linear_narrow_tool_calls, 0),
+        generic_graphql_fallback_reasons: Map.get(entry, :generic_graphql_fallback_reasons, []),
+        issue_state_transitions: Map.get(entry, :issue_state_transitions, []),
+        handoff_comment_id: Map.get(entry, :handoff_comment_id),
+        blocked_reason: Map.get(entry, :blocked_reason)
       }
     }
   end
@@ -149,6 +157,14 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: running.codex_total_tokens,
         effective_tokens: effective_tokens_from(running),
         effective_delta_tokens: Map.get(running, :codex_last_effective_token_delta, 0)
+      },
+      linear_lifecycle: %{
+        generic_graphql_calls: Map.get(running, :linear_generic_graphql_calls, 0),
+        narrow_tool_calls: Map.get(running, :linear_narrow_tool_calls, 0),
+        generic_graphql_fallback_reasons: Map.get(running, :generic_graphql_fallback_reasons, []),
+        issue_state_transitions: Map.get(running, :issue_state_transitions, []),
+        handoff_comment_id: Map.get(running, :handoff_comment_id),
+        blocked_reason: Map.get(running, :blocked_reason)
       }
     }
   end

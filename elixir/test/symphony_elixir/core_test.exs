@@ -1155,7 +1155,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "\"project\":{\"id\":\"project-1\",\"name\":\"Symphony\"}"
     assert prompt =~ "\"team\":{\"id\":\"team-1\",\"key\":\"MT\"}"
     assert prompt =~ "\"state_ids\":{\"Human Review\":\"state-review\",\"In Progress\":\"state-progress\",\"Todo\":\"state-todo\"}"
-    assert prompt =~ "Do not use generic Linear GraphQL to rediscover"
+    assert prompt =~ "Do not call generic Linear GraphQL for normal lifecycle actions"
+    assert prompt =~ "Use the provided narrow Linear helpers"
     assert prompt =~ "SYMPHONY_HANDOFF_READY"
   end
 
