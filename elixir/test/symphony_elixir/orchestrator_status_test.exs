@@ -720,6 +720,115 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.effective_tokens == 50_762
   end
 
+  test "orchestrator blocks docs lane when hard effective token budget is exceeded" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-doc-budget"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "AGE-4",
+      title: "Update README",
+      description: "Docs-only ticket",
+      state: "In Progress",
+      labels: ["docs"]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DocsBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :normal)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    ref = make_ref()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      lane: "docs",
+      classification_reason: "explicit label `docs`",
+      matched_signals: ["label:docs"],
+      policy_version: "2026-05-10.phase3",
+      effective_tokens_budget: 30_000,
+      effective_tokens_remaining: 30_000,
+      turn_budget: 3,
+      tool_call_budget: 12,
+      tool_call_count: 1,
+      tool_call_counts: %{shell: 0, linear_narrow: 1, linear_generic_graphql: 0, github: 0, file_edit: 0, other: 0},
+      linear_generic_graphql_calls: [],
+      budget_state: :ok,
+      finalization_reason: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_effective_tokens: 0,
+      codex_last_effective_token_delta: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_effective_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{
+                 "input_tokens" => 35_000,
+                 "cached_input_tokens" => 0,
+                 "output_tokens" => 1,
+                 "total_tokens" => 35_001
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}, 1_000
+    assert comment =~ "docs lane exceeded token budget before PR"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 1_000
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 

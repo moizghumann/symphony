@@ -271,6 +271,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    field(:lanes, :map, default: %{})
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -353,7 +354,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [])
+    |> cast(attrs, [:lanes])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)

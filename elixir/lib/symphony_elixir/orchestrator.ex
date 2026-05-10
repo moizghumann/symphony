@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, JobPacket, LaneClassifier, LanePolicy, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -21,6 +21,14 @@ defmodule SymphonyElixir.Orchestrator do
     total_tokens: 0,
     effective_tokens: 0,
     seconds_running: 0
+  }
+  @empty_tool_call_counts %{
+    shell: 0,
+    linear_narrow: 0,
+    linear_generic_graphql: 0,
+    github: 0,
+    file_edit: 0,
+    other: 0
   }
 
   defmodule State do
@@ -191,7 +199,10 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        {updated_running_entry, token_delta} =
+          running_entry
+          |> integrate_codex_update(update)
+          |> apply_runtime_budget_tracking(update)
 
         state =
           state
@@ -199,7 +210,8 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_rate_limits(update)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+        {:noreply, maybe_enforce_budget_limit(state, issue_id, updated_running_entry)}
     end
   end
 
@@ -662,7 +674,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        case move_todo_issue_to_in_progress(refreshed_issue) do
+        issue_with_lane = compile_lane_job(refreshed_issue)
+
+        Logger.info("Classified issue lane before dispatch: #{issue_context(issue_with_lane)} lane=#{issue_with_lane.lane_classification.lane} reason=#{issue_with_lane.lane_classification.reason}")
+
+        case move_todo_issue_to_in_progress(issue_with_lane) do
           {:ok, issue_for_dispatch} ->
             do_dispatch_issue(state, issue_for_dispatch, attempt, preferred_worker_host)
 
@@ -704,8 +720,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    lane_policy = issue.lane_policy || LanePolicy.policy_for(:research, Config.settings!().lanes)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             max_turns: lane_policy.max_turns
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -736,6 +758,20 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             codex_last_reported_effective_tokens: 0,
+            lane: Atom.to_string(issue.lane_classification.lane),
+            classification_reason: issue.lane_classification.reason,
+            matched_signals: issue.lane_classification.matched_signals,
+            policy_version: issue.lane_classification.policy_version,
+            lane_policy: lane_policy,
+            effective_tokens_budget: lane_policy.effective_token_budget,
+            effective_tokens_remaining: lane_policy.effective_token_budget,
+            turn_budget: lane_policy.max_turns,
+            tool_call_budget: lane_policy.max_tool_calls,
+            tool_call_count: 1,
+            tool_call_counts: Map.put(@empty_tool_call_counts, :linear_narrow, 1),
+            linear_generic_graphql_calls: [],
+            budget_state: :ok,
+            finalization_reason: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1089,6 +1125,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp compile_lane_job(%Issue{} = issue) do
+    classification = LaneClassifier.classify(issue)
+    policy = LanePolicy.policy_for(classification.lane, Config.settings!().lanes)
+    packet = JobPacket.compile(%{issue | lane_classification: classification, lane_policy: policy}, Config.settings!().lanes)
+
+    %{
+      issue
+      | lane_classification: classification,
+        lane_policy: policy,
+        job_packet: packet
+    }
+  end
+
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
@@ -1154,7 +1203,21 @@ defmodule SymphonyElixir.Orchestrator do
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
           codex_effective_tokens: Map.get(metadata, :codex_effective_tokens, 0),
+          effective_tokens_budget: Map.get(metadata, :effective_tokens_budget),
+          effective_tokens_remaining: Map.get(metadata, :effective_tokens_remaining),
+          budget_state: Map.get(metadata, :budget_state, :ok),
+          finalization_reason: Map.get(metadata, :finalization_reason),
           codex_last_effective_token_delta: Map.get(metadata, :codex_last_effective_token_delta, 0),
+          lane: Map.get(metadata, :lane),
+          classification_reason: Map.get(metadata, :classification_reason),
+          matched_signals: Map.get(metadata, :matched_signals, []),
+          policy_version: Map.get(metadata, :policy_version),
+          turn_budget: Map.get(metadata, :turn_budget),
+          tool_call_count: Map.get(metadata, :tool_call_count, 0),
+          tool_call_budget: Map.get(metadata, :tool_call_budget),
+          tool_call_counts: Map.get(metadata, :tool_call_counts, @empty_tool_call_counts),
+          linear_generic_graphql_calls: Map.get(metadata, :linear_generic_graphql_calls, []),
+          linear_narrow_tool_calls: get_in(metadata, [:tool_call_counts, :linear_narrow]) || 0,
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1245,6 +1308,246 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp apply_runtime_budget_tracking({running_entry, token_delta}, update) when is_map(running_entry) do
+    running_entry =
+      running_entry
+      |> track_tool_call(update)
+      |> refresh_budget_state()
+
+    {running_entry, token_delta}
+  end
+
+  defp apply_runtime_budget_tracking(result, _update), do: result
+
+  defp track_tool_call(running_entry, update) do
+    case tool_call_category(update) do
+      nil ->
+        running_entry
+
+      category ->
+        counts = Map.get(running_entry, :tool_call_counts, @empty_tool_call_counts)
+        counts = Map.update(counts, category, 1, &(&1 + 1))
+
+        running_entry
+        |> Map.put(:tool_call_counts, counts)
+        |> Map.update(:tool_call_count, 1, &(&1 + 1))
+        |> maybe_record_linear_graphql_call(update, category)
+    end
+  end
+
+  defp refresh_budget_state(running_entry) do
+    effective_tokens = Map.get(running_entry, :codex_effective_tokens, 0)
+    effective_budget = Map.get(running_entry, :effective_tokens_budget)
+    tool_count = Map.get(running_entry, :tool_call_count, 0)
+    tool_budget = Map.get(running_entry, :tool_call_budget)
+
+    effective_remaining =
+      if is_integer(effective_budget) do
+        max(effective_budget - effective_tokens, 0)
+      end
+
+    budget_state =
+      cond do
+        budget_exceeded?(effective_tokens, effective_budget) ->
+          :exceeded
+
+        budget_exceeded?(tool_count, tool_budget) ->
+          :exceeded
+
+        budget_warning?(effective_tokens, effective_budget) or budget_warning?(tool_count, tool_budget) ->
+          :warning
+
+        true ->
+          :ok
+      end
+
+    finalization_reason =
+      if budget_state == :exceeded do
+        budget_exceeded_reason(running_entry, effective_tokens, effective_budget, tool_count, tool_budget)
+      else
+        Map.get(running_entry, :finalization_reason)
+      end
+
+    running_entry
+    |> Map.put(:effective_tokens_remaining, effective_remaining)
+    |> Map.put(:budget_state, budget_state)
+    |> Map.put(:finalization_reason, finalization_reason)
+  end
+
+  defp maybe_enforce_budget_limit(%State{} = state, issue_id, %{budget_state: :exceeded} = running_entry) do
+    reason = Map.get(running_entry, :finalization_reason) || "budget exceeded"
+    issue = Map.get(running_entry, :issue)
+
+    Logger.warning("Stopping issue after budget exceeded: issue_id=#{issue_id} reason=#{reason}")
+    _ = Tracker.post_handoff_comment(issue, budget_blocker_comment(running_entry, reason))
+    _ = Tracker.move_issue_to_blocked(issue)
+
+    state
+    |> terminate_running_issue(issue_id, false)
+    |> complete_issue(issue_id)
+  end
+
+  defp maybe_enforce_budget_limit(state, _issue_id, _running_entry), do: state
+
+  defp budget_exceeded?(value, budget) when is_integer(value) and is_integer(budget), do: value > budget
+  defp budget_exceeded?(_value, _budget), do: false
+
+  defp budget_warning?(value, budget) when is_integer(value) and is_integer(budget) and budget > 0 do
+    value >= budget * 0.8
+  end
+
+  defp budget_warning?(_value, _budget), do: false
+
+  defp budget_exceeded_reason(running_entry, effective_tokens, effective_budget, tool_count, tool_budget) do
+    lane = Map.get(running_entry, :lane, "unknown")
+
+    cond do
+      budget_exceeded?(effective_tokens, effective_budget) and lane == "docs" ->
+        "docs lane exceeded token budget before PR"
+
+      budget_exceeded?(effective_tokens, effective_budget) ->
+        "effective token budget exceeded: #{effective_tokens}/#{effective_budget}"
+
+      budget_exceeded?(tool_count, tool_budget) ->
+        "tool-call budget exceeded: #{tool_count}/#{tool_budget}"
+
+      true ->
+        "budget exceeded"
+    end
+  end
+
+  defp budget_blocker_comment(running_entry, reason) do
+    """
+    ## Symphony Budget Blocked
+
+    Symphony stopped this run before Codex could continue outside its lane budget.
+
+    Reason: #{reason}
+
+    Lane: #{Map.get(running_entry, :lane, "unknown")}
+    Effective tokens: #{Map.get(running_entry, :codex_effective_tokens, 0)}/#{Map.get(running_entry, :effective_tokens_budget, "n/a")}
+    Tool calls: #{Map.get(running_entry, :tool_call_count, 0)}/#{Map.get(running_entry, :tool_call_budget, "n/a")}
+    Generic Linear GraphQL calls: #{length(Map.get(running_entry, :linear_generic_graphql_calls, []))}
+    """
+  end
+
+  defp maybe_record_linear_graphql_call(running_entry, update, :linear_generic_graphql) do
+    call = %{
+      reason: "fallback/debug dynamic tool call",
+      operation: graphql_operation(update),
+      narrow_helper_existed: true,
+      narrow_helper_failed: false
+    }
+
+    Map.update(running_entry, :linear_generic_graphql_calls, [call], &(&1 ++ [call]))
+  end
+
+  defp maybe_record_linear_graphql_call(running_entry, _update, _category), do: running_entry
+
+  defp tool_call_category(%{event: event} = update) when event in [:tool_call_completed, :tool_call_failed, :unsupported_tool_call] do
+    case tool_call_name_from_update(update) do
+      "linear_graphql" -> :linear_generic_graphql
+      _ -> :other
+    end
+  end
+
+  defp tool_call_category(update) when is_map(update) do
+    method = update_method(update)
+    command = command_text(update)
+
+    cond do
+      method in ["applyPatchApproval", "item/fileChange/requestApproval"] ->
+        :file_edit
+
+      method in ["execCommandApproval", "item/commandExecution/requestApproval", "codex/event/exec_command_begin"] ->
+        if github_command?(command), do: :github, else: :shell
+
+      method in ["codex/event/apply_patch_begin", "codex/event/file_change"] ->
+        :file_edit
+
+      true ->
+        nil
+    end
+  end
+
+  defp tool_call_category(_update), do: nil
+
+  defp update_method(update) do
+    payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
+    Map.get(payload, "method") || Map.get(payload, :method)
+  end
+
+  defp tool_call_name_from_update(update) do
+    payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
+    params = Map.get(payload, "params") || Map.get(payload, :params) || %{}
+    Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name)
+  end
+
+  defp graphql_operation(update) do
+    query =
+      update
+      |> tool_arguments_from_update()
+      |> then(fn arguments -> Map.get(arguments, "query") || Map.get(arguments, :query) end)
+
+    case query do
+      query when is_binary(query) ->
+        query
+        |> String.trim()
+        |> String.split(~r/\s+/, parts: 3)
+        |> Enum.take(2)
+        |> Enum.join(" ")
+
+      _ ->
+        "unknown"
+    end
+  end
+
+  defp tool_arguments_from_update(update) do
+    payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
+    params = Map.get(payload, "params") || Map.get(payload, :params) || %{}
+    arguments = Map.get(params, "arguments") || Map.get(params, :arguments) || %{}
+    if is_map(arguments), do: arguments, else: %{}
+  end
+
+  defp command_text(update) do
+    update
+    |> command_text_values()
+    |> Enum.find_value(fn
+      value when is_binary(value) -> value
+      value when is_list(value) -> Enum.join(value, " ")
+      _ -> nil
+    end)
+  end
+
+  defp command_text_values(value) when is_map(value) do
+    direct =
+      ["command", :command, "cmd", :cmd]
+      |> Enum.flat_map(fn key ->
+        case Map.get(value, key) do
+          nil -> []
+          found -> [found]
+        end
+      end)
+
+    nested =
+      value
+      |> Map.values()
+      |> Enum.flat_map(&command_text_values/1)
+
+    direct ++ nested
+  end
+
+  defp command_text_values(value) when is_list(value), do: Enum.flat_map(value, &command_text_values/1)
+  defp command_text_values(_value), do: []
+
+  defp github_command?(command) when is_binary(command) do
+    command
+    |> String.trim()
+    |> String.starts_with?("gh ")
+  end
+
+  defp github_command?(_command), do: false
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

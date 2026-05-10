@@ -1097,19 +1097,14 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
+    assert prompt =~ "You are working on Linear issue `MT-616`"
+    assert prompt =~ "Symphony lane-specific job packet"
+    assert prompt =~ "\"lane\": \"docs\""
+    assert prompt =~ "\"classification_reason\": \"matched docs signal\""
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "Continuation context:"
-    assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Follow the lane policy exactly"
+    assert prompt =~ "Codex owns repository work only"
+    assert prompt =~ "Continuation attempt #2"
   end
 
   test "prompt builder adds continuation guidance for retries" do

@@ -9,9 +9,9 @@
 │ Next refresh: n/a
 ├─ Running
 │
-│   ID       STAGE          PID      AGE / TURN   EFFECTIVE  SESSION        EVENT
+│   ID       LANE     STAGE          PID      AGE / TURN   EFFECTIVE  BUDGET         SESSION        EVENT
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ ● MT-638   retrying       4242     20m 25s / 7      14,200 thre...567890  agent message streaming: waiting on ...
+│ ● MT-638   unknown  retrying       4242     20m 25s / 7      14,200 ok 0           thre...567890  agent messag...
 │
 ├─ Backoff queue
 │

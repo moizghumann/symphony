@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, JobPacket, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -25,7 +25,7 @@ defmodule SymphonyElixir.PromptBuilder do
       )
       |> IO.iodata_to_binary()
 
-    [issue_packet_prompt(issue), "\n\n", rendered_prompt]
+    [issue_packet_prompt(issue), "\n\n", job_packet_prompt(issue), "\n\n", rendered_prompt]
     |> IO.iodata_to_binary()
   end
 
@@ -51,6 +51,12 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
+  defp job_packet_prompt(issue) do
+    issue
+    |> JobPacket.compile(configured_lanes())
+    |> JobPacket.render_prompt()
+  end
+
   defp issue_packet(issue) do
     issue
     |> Map.from_struct()
@@ -68,10 +74,18 @@ defmodule SymphonyElixir.PromptBuilder do
       :branch_name,
       :labels,
       :priority,
-      :blocked_by
+      :blocked_by,
+      :lane_classification
     ])
     |> Map.put(:state_ids, state_ids(issue))
     |> to_packet_value()
+  end
+
+  defp configured_lanes do
+    case Workflow.current() do
+      {:ok, %{config: %{lanes: lanes}}} when is_map(lanes) -> lanes
+      _ -> %{}
+    end
   end
 
   defp state_ids(%{available_states: states}) when is_list(states) do

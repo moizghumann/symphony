@@ -137,9 +137,9 @@ defmodule SymphonyElixir.AgentRunner do
         continue_codex_turn(app_session, refreshed_issue, turn_context, turn_number, max_turns)
 
       {:continue, refreshed_issue} ->
-        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+        Logger.info("Reached lane max_turns for #{issue_context(refreshed_issue)} with issue still active; blocking for human review")
 
-        :ok
+        block_issue_for_max_turns(refreshed_issue, max_turns)
 
       {:done, _refreshed_issue} ->
         :ok
@@ -174,6 +174,24 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
     end
   end
+
+  defp block_issue_for_max_turns(issue, max_turns) do
+    _ =
+      Tracker.post_handoff_comment(issue, """
+      ## Symphony Handoff Blocked
+
+      Symphony stopped this run because the lane turn budget was exhausted before a draft PR handoff was ready.
+
+      Max turns: #{max_turns}
+      Lane: #{lane_name(issue)}
+      """)
+
+    _ = Tracker.move_issue_to_blocked(issue)
+    :ok
+  end
+
+  defp lane_name(%Issue{lane_classification: %{lane: lane}}), do: lane
+  defp lane_name(_issue), do: "unknown"
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
