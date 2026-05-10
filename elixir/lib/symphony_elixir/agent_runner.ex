@@ -80,19 +80,17 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
+    turn_context = %{
+      workspace: workspace,
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      worker_host: worker_host
+    }
+
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          worker_host,
-          1,
-          max_turns
-        )
+        do_run_codex_turns(session, issue, turn_context, 1, max_turns)
       after
         AppServer.stop_session(session)
       end
@@ -101,53 +99,35 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(
          app_session,
-         workspace,
          issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         worker_host,
+         turn_context,
          turn_number,
          max_turns
        ) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, turn_context.opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(turn_context.codex_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{turn_context.workspace} turn=#{turn_number}/#{max_turns}")
 
-      case GitHubHandoff.complete(workspace, issue, worker_host) do
-        {:ok, pr_url} ->
-          Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
-          :ok
-
-        {:error, reason} ->
-          {:error, {:github_handoff_failed, reason}}
-
-        :no_repo_changes ->
-          continue_after_turn(issue, issue_state_fetcher, app_session, workspace, codex_update_recipient, opts, worker_host, turn_number, max_turns)
-      end
+      continue_after_turn(issue, app_session, turn_context, turn_number, max_turns)
     end
   end
 
-  defp continue_after_turn(issue, issue_state_fetcher, app_session, workspace, codex_update_recipient, opts, worker_host, turn_number, max_turns) do
-    case continue_with_issue?(issue, issue_state_fetcher) do
+  defp continue_after_turn(issue, app_session, turn_context, turn_number, max_turns) do
+    case continue_with_issue?(issue, turn_context.issue_state_fetcher) do
       {:continue, refreshed_issue} when turn_number < max_turns ->
         Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
         do_run_codex_turns(
           app_session,
-          workspace,
           refreshed_issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          worker_host,
+          turn_context,
           turn_number + 1,
           max_turns
         )
@@ -157,11 +137,25 @@ defmodule SymphonyElixir.AgentRunner do
 
         :ok
 
-      {:done, _refreshed_issue} ->
-        :ok
+      {:done, refreshed_issue} ->
+        complete_handoff(turn_context.workspace, refreshed_issue, turn_context.worker_host)
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp complete_handoff(workspace, issue, worker_host) do
+    case GitHubHandoff.complete(workspace, issue, worker_host) do
+      {:ok, pr_url} ->
+        Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
+        :ok
+
+      {:error, reason} ->
+        {:error, {:github_handoff_failed, reason}}
+
+      :no_repo_changes ->
+        :ok
     end
   end
 

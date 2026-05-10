@@ -373,12 +373,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{
-                   "cached_input_tokens" => 0,
+                   "cached_input_tokens" => 40,
                    "effective_delta_tokens" => 0,
-                   "effective_tokens" => 12,
-                   "input_tokens" => 4,
-                   "output_tokens" => 8,
-                   "total_tokens" => 12
+                   "effective_tokens" => 67,
+                   "input_tokens" => 100,
+                   "output_tokens" => 7,
+                   "total_tokens" => 120
                  }
                }
              ],
@@ -394,13 +394,20 @@ defmodule SymphonyElixir.ExtensionsTest do
                }
              ],
              "codex_totals" => %{
-               "input_tokens" => 4,
-               "output_tokens" => 8,
-               "total_tokens" => 12,
+               "cached_input_tokens" => 40,
+               "effective_tokens" => 67,
+               "input_tokens" => 100,
+               "output_tokens" => 7,
+               "total_tokens" => 120,
                "seconds_running" => 42.5
              },
              "rate_limits" => %{"primary" => %{"remaining" => 11}}
            }
+
+    assert get_in(state_payload, ["running", Access.at(0), "tokens", "effective_tokens"]) ==
+             100 - 40 + 7
+
+    assert get_in(state_payload, ["running", Access.at(0), "tokens", "total_tokens"]) == 120
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
@@ -425,12 +432,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_message" => "rendered",
                "last_event_at" => nil,
                "tokens" => %{
-                 "cached_input_tokens" => 0,
+                 "cached_input_tokens" => 40,
                  "effective_delta_tokens" => 0,
-                 "effective_tokens" => 12,
-                 "input_tokens" => 4,
-                 "output_tokens" => 8,
-                 "total_tokens" => 12
+                 "effective_tokens" => 67,
+                 "input_tokens" => 100,
+                 "output_tokens" => 7,
+                 "total_tokens" => 120
                }
              },
              "retry" => nil,
@@ -578,6 +585,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "Effective tokens"
+    assert html =~ ">67<"
+    assert html =~ "Gross context 120 / cached 40"
+    assert html =~ "Effective: 67"
+    assert html =~ "gross 120"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -726,9 +738,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_message: "rendered",
           last_codex_timestamp: nil,
           last_codex_event: :notification,
-          codex_input_tokens: 4,
-          codex_output_tokens: 8,
-          codex_total_tokens: 12,
+          codex_input_tokens: 100,
+          codex_cached_input_tokens: 40,
+          codex_output_tokens: 7,
+          codex_total_tokens: 120,
           started_at: DateTime.utc_now()
         }
       ],
@@ -741,7 +754,14 @@ defmodule SymphonyElixir.ExtensionsTest do
           error: "boom"
         }
       ],
-      codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
+      codex_totals: %{
+        input_tokens: 100,
+        cached_input_tokens: 40,
+        output_tokens: 7,
+        total_tokens: 120,
+        effective_tokens: 67,
+        seconds_running: 42.5
+      },
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
   end

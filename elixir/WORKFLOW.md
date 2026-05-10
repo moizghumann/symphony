@@ -73,7 +73,7 @@ Work only in the provided repository copy. Do not touch any other path.
 
 Symphony injects a compact Linear issue packet before this workflow prompt. Treat that packet as authoritative for issue id, identifier, title, description, URL, current state, project, team, and available state ids. The `linear_graphql` tool is a fallback only; do not use it to rediscover packet data.
 
-Symphony owns the final GitHub draft PR creation, Linear handoff comment, and Linear state transition to `Human Review` or `Blocked`. Do not create the PR manually unless the orchestrator explicitly asks for fallback help. The orchestrator PR path must use:
+Codex owns repository work: edit, validate, commit, push, and summarize the completed change. Symphony owns deterministic issue plumbing after Codex has finished: create the draft PR, post the Linear handoff comment, and move the ticket to `Human Review` or `Blocked`. Do not create the PR manually unless the orchestrator explicitly asks for fallback help. The orchestrator PR path must use:
 
 ```bash
 gh pr create --draft --head <branch> --base main ...
@@ -218,7 +218,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8.  Do not attach or create the final PR manually; Symphony will commit, push, create the draft PR, post the handoff comment, and move the issue after Codex completes the repository work.
+8.  Commit and push your branch after validation passes. Do not attach or create the final PR manually; Symphony will create the draft PR, post the handoff comment, and move the issue after Codex completes the repository work.
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.

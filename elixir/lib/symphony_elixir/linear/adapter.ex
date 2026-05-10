@@ -5,8 +5,8 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.Issue
 
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {

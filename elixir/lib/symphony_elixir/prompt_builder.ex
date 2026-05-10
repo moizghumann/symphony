@@ -46,7 +46,7 @@ defmodule SymphonyElixir.PromptBuilder do
 
     - Symphony already resolved this Linear issue and state metadata before launch.
     - Do not use generic Linear GraphQL to rediscover issue id, state ids, team, project, title, description, or URL unless this packet is missing data required for the task.
-    - Symphony owns the final GitHub draft PR creation, Linear handoff comment, and Human Review/Blocked state transitions. Focus Codex work on repository changes and validation.
+    - Codex owns repository work: edit, validate, commit, push, and summarize. Symphony owns final draft PR creation, the Linear handoff comment, and Human Review/Blocked state transitions.
     """
   end
 

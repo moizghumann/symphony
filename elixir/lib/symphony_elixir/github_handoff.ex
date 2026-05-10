@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.GitHubHandoff do
   @moduledoc """
-  Publishes completed repository changes and hands a draft PR back to Linear.
+  Creates the draft PR for already-pushed repository changes and hands it back to Linear.
   """
 
   require Logger
@@ -18,8 +18,8 @@ defmodule SymphonyElixir.GitHubHandoff do
     with :ok <- ensure_git_repo(workspace, worker_host),
          true <- repo_changing_ticket?(workspace, worker_host),
          {:ok, branch} <- ensure_branch(workspace, issue, worker_host),
-         :ok <- commit_changes(workspace, issue, worker_host),
-         :ok <- push_branch(workspace, branch, worker_host),
+         :ok <- ensure_committed(workspace, worker_host),
+         :ok <- ensure_pushed(workspace, branch, worker_host),
          {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url),
          :ok <- Tracker.move_issue_to_state(issue, "Human Review") do
@@ -45,7 +45,11 @@ defmodule SymphonyElixir.GitHubHandoff do
         if String.trim(output) == "true", do: :ok, else: {:error, :not_a_git_repo}
 
       {:error, reason} ->
-        if git_not_a_repo_error?(reason), do: {:error, :not_a_git_repo}, else: {:error, {:git_repo_check_failed, reason}}
+        if git_not_a_repo_error?(reason) do
+          {:error, :not_a_git_repo}
+        else
+          {:error, {:git_repo_check_failed, reason}}
+        end
     end
   end
 
@@ -61,12 +65,7 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp ensure_branch(workspace, %Issue{} = issue, worker_host) do
     with {:ok, branch} <- current_branch(workspace, worker_host) do
       if branch in ["", "main", "master"] do
-        branch = issue_branch_name(issue)
-
-        case run(workspace, "git", ["switch", "-c", branch], worker_host) do
-          {:ok, _output} -> {:ok, branch}
-          {:error, reason} -> {:error, {:git_branch_failed, reason}}
-        end
+        {:error, {:git_branch_failed, {:invalid_handoff_branch, branch, issue_branch_name(issue)}}}
       else
         {:ok, branch}
       end
@@ -93,25 +92,31 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp issue_branch_name(_issue), do: "symphony/issue"
 
-  defp commit_changes(workspace, %Issue{} = issue, worker_host) do
-    with {:ok, _} <- run(workspace, "git", ["add", "-A"], worker_host),
-         {:ok, staged} <- run(workspace, "git", ["diff", "--cached", "--name-only"], worker_host) do
-      if String.trim(staged) == "" do
-        :ok
-      else
-        case run(workspace, "git", ["commit", "-m", commit_message(issue)], worker_host) do
-          {:ok, _output} -> :ok
-          {:error, reason} -> {:error, {:git_commit_failed, reason}}
+  defp ensure_committed(workspace, worker_host) do
+    case run(workspace, "git", ["status", "--porcelain"], worker_host) do
+      {:ok, output} ->
+        if String.trim(output) == "" do
+          :ok
+        else
+          {:error, {:git_commit_failed, {:uncommitted_changes, output}}}
         end
-      end
-    else
-      {:error, reason} -> {:error, {:git_commit_prepare_failed, reason}}
+
+      {:error, reason} ->
+        {:error, {:git_commit_failed, reason}}
     end
   end
 
-  defp push_branch(workspace, branch, worker_host) when is_binary(branch) do
-    case run(workspace, "git", ["push", "-u", "origin", branch], worker_host) do
-      {:ok, _output} -> :ok
+  defp ensure_pushed(workspace, branch, worker_host) when is_binary(branch) do
+    with {:ok, head_sha} <- run(workspace, "git", ["rev-parse", "HEAD"], worker_host),
+         {:ok, remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", branch], worker_host) do
+      local_sha = String.trim(head_sha)
+
+      if remote_contains_sha?(remote_output, local_sha) do
+        :ok
+      else
+        {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
+      end
+    else
       {:error, reason} -> {:error, {:git_push_failed, reason}}
     end
   end
@@ -251,6 +256,17 @@ defmodule SymphonyElixir.GitHubHandoff do
   end
 
   defp git_not_a_repo_error?(_reason), do: false
+
+  defp remote_contains_sha?(remote_output, local_sha) when is_binary(remote_output) and is_binary(local_sha) do
+    remote_output
+    |> String.split("\n", trim: true)
+    |> Enum.any?(fn line ->
+      line
+      |> String.split()
+      |> List.first()
+      |> Kernel.==(local_sha)
+    end)
+  end
 
   defp slug(value) when is_binary(value) do
     value
