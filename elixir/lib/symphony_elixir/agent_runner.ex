@@ -5,7 +5,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, GitHubHandoff, Linear.Issue, PromptBuilder, Tracker, Workspace}
+
+  @handoff_ready_marker "SYMPHONY_HANDOFF_READY"
 
   @type worker_host :: String.t() | nil
 
@@ -48,6 +50,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
+      record_handoff_ready(message)
       send_codex_update(recipient, issue, message)
     end
   end
@@ -79,54 +82,96 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    reset_handoff_ready()
+
+    turn_context = %{
+      workspace: workspace,
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      worker_host: worker_host
+    }
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(session, issue, turn_context, 1, max_turns)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turns(
+         app_session,
+         issue,
+         turn_context,
+         turn_number,
+         max_turns
+       ) do
+    prompt = build_turn_prompt(issue, turn_context.opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(turn_context.codex_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{turn_context.workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      continue_after_turn(issue, app_session, turn_context, turn_number, max_turns, handoff_ready?())
+    end
+  end
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+  defp continue_after_turn(issue, app_session, turn_context, turn_number, max_turns, handoff_ready) do
+    if handoff_ready do
+      complete_handoff(turn_context.workspace, issue, turn_context.worker_host)
+    else
+      continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns)
+    end
+  end
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+  defp continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns) do
+    case continue_with_issue?(issue, turn_context.issue_state_fetcher) do
+      {:continue, refreshed_issue} when turn_number < max_turns ->
+        continue_codex_turn(app_session, refreshed_issue, turn_context, turn_number, max_turns)
 
-          :ok
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-        {:done, _refreshed_issue} ->
-          :ok
+        :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp continue_codex_turn(app_session, refreshed_issue, turn_context, turn_number, max_turns) do
+    Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+    do_run_codex_turns(
+      app_session,
+      refreshed_issue,
+      turn_context,
+      turn_number + 1,
+      max_turns
+    )
+  end
+
+  defp complete_handoff(workspace, issue, worker_host) do
+    case GitHubHandoff.complete(workspace, issue, worker_host) do
+      {:ok, pr_url} ->
+        Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
+        :ok
+
+      {:error, reason} ->
+        {:error, {:github_handoff_failed, reason}}
+
+      :no_repo_changes ->
+        :ok
     end
   end
 
@@ -162,6 +207,35 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp reset_handoff_ready do
+    Process.put({__MODULE__, :handoff_ready}, false)
+  end
+
+  defp record_handoff_ready(message) do
+    if handoff_ready_message?(message) do
+      Process.put({__MODULE__, :handoff_ready}, true)
+    end
+  end
+
+  defp handoff_ready? do
+    Process.get({__MODULE__, :handoff_ready}, false) == true
+  end
+
+  defp handoff_ready_message?(message) when is_binary(message),
+    do: String.contains?(message, @handoff_ready_marker)
+
+  defp handoff_ready_message?(%_{}), do: false
+
+  defp handoff_ready_message?(message) when is_map(message) do
+    Enum.any?(message, fn {_key, value} -> handoff_ready_message?(value) end)
+  end
+
+  defp handoff_ready_message?(message) when is_list(message) do
+    Enum.any?(message, &handoff_ready_message?/1)
+  end
+
+  defp handoff_ready_message?(_message), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

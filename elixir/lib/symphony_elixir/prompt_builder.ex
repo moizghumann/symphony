@@ -14,16 +14,85 @@ defmodule SymphonyElixir.PromptBuilder do
       |> prompt_template!()
       |> parse_template!()
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
+    rendered_prompt =
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+
+    [issue_packet_prompt(issue), "\n\n", rendered_prompt]
     |> IO.iodata_to_binary()
   end
+
+  defp issue_packet_prompt(issue) do
+    packet =
+      issue
+      |> issue_packet()
+      |> Jason.encode!(pretty: false)
+
+    """
+    Symphony orchestrator issue packet:
+
+    ```json
+    #{packet}
+    ```
+
+    Orchestration boundary:
+
+    - Symphony already resolved this Linear issue and state metadata before launch.
+    - Do not use generic Linear GraphQL to rediscover issue id, state ids, team, project, title, description, or URL unless this packet is missing data required for the task.
+    - Codex owns repository work: edit, validate, commit, push, and summarize. Symphony owns final draft PR creation, the Linear handoff comment, and Human Review/Blocked state transitions.
+    - When repository work is complete, committed, pushed, and validated, include the exact marker `SYMPHONY_HANDOFF_READY` in your final response so Symphony can create the draft PR.
+    """
+  end
+
+  defp issue_packet(issue) do
+    issue
+    |> Map.from_struct()
+    |> Map.take([
+      :id,
+      :identifier,
+      :title,
+      :description,
+      :url,
+      :state,
+      :state_id,
+      :project,
+      :team,
+      :available_states,
+      :branch_name,
+      :labels,
+      :priority,
+      :blocked_by
+    ])
+    |> Map.put(:state_ids, state_ids(issue))
+    |> to_packet_value()
+  end
+
+  defp state_ids(%{available_states: states}) when is_list(states) do
+    Map.new(states, fn
+      %{name: name, id: id} -> {name, id}
+      %{"name" => name, "id" => id} -> {name, id}
+      _ -> {nil, nil}
+    end)
+    |> Map.delete(nil)
+  end
+
+  defp state_ids(_issue), do: %{}
+
+  defp to_packet_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp to_packet_value(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
+  defp to_packet_value(%Date{} = value), do: Date.to_iso8601(value)
+  defp to_packet_value(%Time{} = value), do: Time.to_iso8601(value)
+  defp to_packet_value(%_{} = value), do: inspect(value)
+  defp to_packet_value(value) when is_map(value), do: Map.new(value, fn {key, nested} -> {key, to_packet_value(nested)} end)
+  defp to_packet_value(value) when is_list(value), do: Enum.map(value, &to_packet_value/1)
+  defp to_packet_value(value), do: value
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
 

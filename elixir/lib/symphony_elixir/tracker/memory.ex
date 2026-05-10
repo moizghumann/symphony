@@ -47,6 +47,21 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec move_issue_to_state(term(), String.t()) :: :ok | {:error, term()}
+  def move_issue_to_state(issue_or_id, state_name) do
+    update_issue_state(issue_id(issue_or_id), state_name)
+  end
+
+  @spec move_issue_to_blocked(term()) :: :ok | {:error, term()}
+  def move_issue_to_blocked(issue_or_id) do
+    move_issue_to_state(issue_or_id, "Blocked")
+  end
+
+  @spec post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
+  def post_handoff_comment(issue_or_id, body) do
+    create_comment(issue_id(issue_or_id), body)
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end
@@ -61,6 +76,9 @@ defmodule SymphonyElixir.Tracker.Memory do
       _ -> :ok
     end
   end
+
+  defp issue_id(%Issue{id: id}), do: id
+  defp issue_id(id), do: id
 
   defp normalize_state(state) when is_binary(state) do
     state

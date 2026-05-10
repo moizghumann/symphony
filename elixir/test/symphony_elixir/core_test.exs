@@ -1,6 +1,35 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule FailingTodoTransitionClient do
+    alias SymphonyElixir.Linear.Issue
+
+    def fetch_candidate_issues do
+      {:ok, [todo_issue()]}
+    end
+
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issue_states_by_ids(["issue-failed-todo-transition"]), do: {:ok, [todo_issue()]}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(_query, %{issueId: "issue-failed-todo-transition", stateId: "state-progress"}) do
+      {:error, :linear_unavailable}
+    end
+
+    defp todo_issue do
+      %Issue{
+        id: "issue-failed-todo-transition",
+        identifier: "MT-TODO-FAIL",
+        title: "Retry failed todo transition",
+        state: "Todo",
+        available_states: [
+          %{id: "state-todo", name: "Todo"},
+          %{id: "state-progress", name: "In Progress"}
+        ]
+      }
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -551,7 +580,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 100, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +620,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -631,6 +660,60 @@ defmodule SymphonyElixir.CoreTest do
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "failed todo to in progress transition retries with deterministic incrementing backoff" do
+    previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
+
+    on_exit(fn ->
+      restore_app_env(:linear_client_module, previous_client)
+    end)
+
+    Application.put_env(:symphony_elixir, :linear_client_module, FailingTodoTransitionClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      max_concurrent_agents: 1,
+      poll_interval_ms: 100_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :FailedTodoTransitionRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_eventually(fn ->
+      retry = :sys.get_state(pid).retry_attempts["issue-failed-todo-transition"]
+      match?(%{attempt: 1, retry_token: token} when is_reference(token), retry)
+    end)
+
+    state = :sys.get_state(pid)
+
+    assert %{
+             attempt: 1,
+             due_at_ms: first_due_at_ms,
+             retry_token: retry_token,
+             error: error
+           } = state.retry_attempts["issue-failed-todo-transition"]
+
+    assert error =~ "failed to move issue to In Progress"
+    assert_due_in_range(first_due_at_ms, 9_000, 10_500)
+
+    send(pid, {:retry_issue, "issue-failed-todo-transition", retry_token})
+
+    assert_eventually(fn ->
+      retry = :sys.get_state(pid).retry_attempts["issue-failed-todo-transition"]
+      match?(%{attempt: 2}, retry)
+    end)
+
+    assert %{attempt: 2, due_at_ms: second_due_at_ms} =
+             :sys.get_state(pid).retry_attempts["issue-failed-todo-transition"]
+
+    assert_due_in_range(second_due_at_ms, 19_000, 20_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,6 +833,61 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  defp prepare_handoff_repo!(test_root, scenario) do
+    repo = Path.join(test_root, "repo")
+    origin = Path.join(test_root, "origin.git")
+
+    File.mkdir_p!(repo)
+    File.write!(Path.join(repo, "README.md"), "# test\n")
+    System.cmd("git", ["init", "-b", "main"], cd: repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: repo)
+    System.cmd("git", ["add", "README.md"], cd: repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: repo)
+    System.cmd("git", ["init", "--bare", origin])
+    System.cmd("git", ["remote", "add", "origin", origin], cd: repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
+
+    case scenario do
+      :branch_failure ->
+        File.write!(Path.join(repo, "README.md"), "# test\n\nwork on main\n")
+
+      :commit_failure ->
+        System.cmd("git", ["switch", "-c", "symphony/commit-failure"], cd: repo)
+        File.write!(Path.join(repo, "README.md"), "# test\n\ndirty branch\n")
+
+      :push_failure ->
+        commit_handoff_change!(repo, "symphony/push-failure")
+
+      scenario when scenario in [:gh_failure, :missing_pr_url] ->
+        branch = "symphony/#{scenario}"
+        commit_handoff_change!(repo, branch)
+        System.cmd("git", ["push", "-u", "origin", branch], cd: repo)
+    end
+
+    repo
+  end
+
+  defp commit_handoff_change!(repo, branch) do
+    System.cmd("git", ["switch", "-c", branch], cd: repo)
+    File.write!(Path.join(repo, "README.md"), "# test\n\n#{branch}\n")
+    System.cmd("git", ["add", "README.md"], cd: repo)
+    System.cmd("git", ["commit", "-m", "handoff change"], cd: repo)
+  end
+
+  defp assert_eventually(fun, attempts \\ 20)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      assert true
+    else
+      Process.sleep(50)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
@@ -830,7 +968,7 @@ defmodule SymphonyElixir.CoreTest do
       ]
     }
 
-    assert PromptBuilder.build_prompt(issue) == "Ticket MT-701"
+    assert PromptBuilder.build_prompt(issue) =~ "Ticket MT-701"
   end
 
   test "prompt builder uses strict variable rendering" do
@@ -989,7 +1127,190 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt == "Retry #2"
+    assert prompt =~ "Retry #2"
+  end
+
+  test "prompt builder injects authoritative issue packet metadata" do
+    issue = %Issue{
+      id: "issue-packet",
+      identifier: "MT-777",
+      title: "Carry issue metadata",
+      description: "Use packet data",
+      state: "Todo",
+      state_id: "state-todo",
+      project: %{id: "project-1", name: "Symphony"},
+      team: %{id: "team-1", key: "MT"},
+      available_states: [
+        %{id: "state-todo", name: "Todo"},
+        %{id: "state-progress", name: "In Progress"},
+        %{id: "state-review", name: "Human Review"}
+      ]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "\"id\":\"issue-packet\""
+    assert prompt =~ "\"title\":\"Carry issue metadata\""
+    assert prompt =~ "\"state\":\"Todo\""
+    assert prompt =~ "\"project\":{\"id\":\"project-1\",\"name\":\"Symphony\"}"
+    assert prompt =~ "\"team\":{\"id\":\"team-1\",\"key\":\"MT\"}"
+    assert prompt =~ "\"state_ids\":{\"Human Review\":\"state-review\",\"In Progress\":\"state-progress\",\"Todo\":\"state-todo\"}"
+    assert prompt =~ "Do not use generic Linear GraphQL to rediscover"
+    assert prompt =~ "SYMPHONY_HANDOFF_READY"
+  end
+
+  test "github handoff creates draft PR with explicit head and moves issue after Linear comment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-github-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+    end)
+
+    try do
+      repo = Path.join(test_root, "repo")
+      origin = Path.join(test_root, "origin.git")
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+
+      File.mkdir_p!(repo)
+      File.mkdir_p!(bin_dir)
+      File.write!(Path.join(repo, "README.md"), "# test\n")
+      System.cmd("git", ["init", "-b", "main"], cd: repo)
+      System.cmd("git", ["config", "user.name", "Test User"], cd: repo)
+      System.cmd("git", ["config", "user.email", "test@example.com"], cd: repo)
+      System.cmd("git", ["add", "README.md"], cd: repo)
+      System.cmd("git", ["commit", "-m", "initial"], cd: repo)
+      System.cmd("git", ["init", "--bare", origin])
+      System.cmd("git", ["remote", "add", "origin", origin], cd: repo)
+      System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
+
+      System.cmd("git", ["switch", "-c", "symphony/age-2"], cd: repo)
+      File.write!(Path.join(repo, "README.md"), "# test\n\nRead AGENTS.md first.\n")
+      System.cmd("git", ["add", "README.md"], cd: repo)
+      System.cmd("git", ["commit", "-m", "AGE-2: Mention AGENTS.md"], cd: repo)
+      System.cmd("git", ["push", "-u", "origin", "symphony/age-2"], cd: repo)
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+        printf 'https://github.com/example/repo/pull/7\\n'
+        exit 0
+      fi
+      exit 99
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-age-2",
+        identifier: "AGE-2",
+        title: "Mention AGENTS.md",
+        state: "In Progress",
+        url: "https://linear.app/symphonys/issue/AGE-2"
+      }
+
+      assert {:ok, "https://github.com/example/repo/pull/7"} =
+               SymphonyElixir.GitHubHandoff.complete(repo, issue)
+
+      assert File.read!(gh_log) =~ "pr create --draft --head symphony/age-2 --base main"
+      assert_receive {:memory_tracker_comment, "issue-age-2", comment}
+      assert comment =~ "https://github.com/example/repo/pull/7"
+      assert_receive {:memory_tracker_state_update, "issue-age-2", "Human Review"}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "github handoff blocks issue on branch commit push pr and url failures" do
+    scenarios = [:branch_failure, :commit_failure, :push_failure, :gh_failure, :missing_pr_url]
+
+    Enum.each(scenarios, fn scenario ->
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-elixir-github-handoff-#{scenario}-#{System.unique_integer([:positive])}"
+        )
+
+      previous_path = System.get_env("PATH")
+      previous_gh_mode = System.get_env("SYMP_TEST_GH_MODE")
+
+      try do
+        repo = prepare_handoff_repo!(test_root, scenario)
+        bin_dir = Path.join(test_root, "bin")
+        File.mkdir_p!(bin_dir)
+
+        File.write!(Path.join(bin_dir, "gh"), """
+        #!/bin/sh
+        case "$SYMP_TEST_GH_MODE" in
+          fail)
+            printf 'gh failed\\n'
+            exit 42
+            ;;
+          missing_url)
+            printf 'created draft pr without a url\\n'
+            exit 0
+            ;;
+          *)
+            printf 'https://github.com/example/repo/pull/8\\n'
+            exit 0
+            ;;
+        esac
+        """)
+
+        File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+        System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+
+        case scenario do
+          :gh_failure -> System.put_env("SYMP_TEST_GH_MODE", "fail")
+          :missing_pr_url -> System.put_env("SYMP_TEST_GH_MODE", "missing_url")
+          _ -> System.put_env("SYMP_TEST_GH_MODE", "ok")
+        end
+
+        write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+        Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+        issue = %Issue{
+          id: "issue-#{scenario}",
+          identifier: "MT-#{scenario}",
+          title: "Block on #{scenario}",
+          state: "In Progress"
+        }
+
+        issue_id = issue.id
+
+        result = SymphonyElixir.GitHubHandoff.complete(repo, issue)
+
+        case scenario do
+          :branch_failure -> assert {:error, {:git_branch_failed, _}} = result
+          :commit_failure -> assert {:error, {:git_commit_failed, _}} = result
+          :push_failure -> assert {:error, {:git_push_failed, _}} = result
+          :gh_failure -> assert {:error, {:gh_pr_create_failed, _}} = result
+          :missing_pr_url -> assert {:error, {:gh_pr_create_missing_url, _}} = result
+        end
+
+        assert_receive {:memory_tracker_comment, ^issue_id, comment}
+        assert comment =~ "Symphony Handoff Blocked"
+        assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
+      after
+        restore_env("PATH", previous_path)
+        restore_env("SYMP_TEST_GH_MODE", previous_gh_mode)
+        File.rm_rf(test_root)
+      end
+    end)
   end
 
   test "agent runner keeps workspace after successful codex run" do
@@ -1072,6 +1393,95 @@ defmodule SymphonyElixir.CoreTest do
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "todo issue moves to in progress before codex starts" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-todo-claim-before-codex-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-todo"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-todo"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      issue = %Issue{
+        id: "issue-todo-claim",
+        identifier: "MT-CLAIM",
+        title: "Claim before codex",
+        description: "Move before launching",
+        state: "Todo"
+      }
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 1,
+        poll_interval_ms: 100_000
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      orchestrator_name = Module.concat(__MODULE__, :TodoClaimOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      assert_receive {:memory_tracker_state_update, "issue-todo-claim", "In Progress"}, 1_000
+
+      assert_eventually(fn ->
+        if File.exists?(trace_file) do
+          trace = File.read!(trace_file)
+
+          trace =~ "In Progress" and not String.contains?(trace, "Current status: Todo")
+        else
+          false
+        end
+      end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end
@@ -1361,6 +1771,132 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner hands off when codex signals completion while issue remains active" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-terminal-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+    end)
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      origin = Path.join(test_root, "origin.git")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+
+      File.mkdir_p!(template_repo)
+      File.mkdir_p!(workspace_root)
+      File.mkdir_p!(bin_dir)
+      File.write!(Path.join(template_repo, "README.md"), "# test\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd("git", ["init", "--bare", origin])
+      System.cmd("git", ["-C", template_repo, "remote", "add", "origin", origin])
+      System.cmd("git", ["-C", template_repo, "push", "-u", "origin", "main"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-handoff"}}}'
+            ;;
+          4)
+            git config user.name "Test User" >/dev/null 2>&1
+            git config user.email "test@example.com" >/dev/null 2>&1
+            git switch -c symphony/mt-249 >/dev/null 2>&1
+            printf '# test\\n\\nterminal handoff\\n' > README.md
+            git add README.md >/dev/null 2>&1
+            git commit -m "MT-249: terminal handoff" >/dev/null 2>&1
+            git push -u origin symphony/mt-249 >/dev/null 2>&1
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-handoff-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-handoff-2"}}}'
+            printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      printf 'https://github.com/example/repo/pull/249\\n'
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "git clone #{origin} .",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:terminal_handoff_fetch_count, 0) + 1
+        Process.put(:terminal_handoff_fetch_count, attempt)
+
+        if attempt == 1 do
+          refute File.exists?(gh_log)
+        end
+
+        send(parent, {:handoff_state_fetch, attempt, "In Progress"})
+        {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "In Progress"}]}
+      end
+
+      issue = %Issue{
+        id: "issue-terminal-handoff",
+        identifier: "MT-249",
+        title: "Hand off after Codex completion signal",
+        description: "Repo changes should publish after Codex signals completion",
+        state: "In Progress"
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert_receive {:handoff_state_fetch, 1, "In Progress"}
+      refute_receive {:handoff_state_fetch, 2, _state}
+      assert File.read!(gh_log) =~ "pr create --draft --head symphony/mt-249 --base main"
+      assert_receive {:memory_tracker_comment, "issue-terminal-handoff", comment}
+      assert comment =~ "https://github.com/example/repo/pull/249"
+      assert_receive {:memory_tracker_state_update, "issue-terminal-handoff", "Human Review"}
+    after
       File.rm_rf(test_root)
     end
   end

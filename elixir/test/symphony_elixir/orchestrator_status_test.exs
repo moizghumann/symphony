@@ -630,6 +630,96 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "orchestrator token accounting reports effective usage excluding cached input" do
+    issue_id = "issue-effective-token-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-225",
+      title: "Effective token usage",
+      description: "Separate gross and cached usage",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-225"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :EffectiveTokenUsageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_effective_tokens: 0,
+      codex_last_effective_token_delta: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_effective_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "tokenUsage" => %{
+               "total" => %{
+                 "input_tokens" => 349_093,
+                 "cached_input_tokens" => 300_672,
+                 "output_tokens" => 2_341,
+                 "total_tokens" => 351_434
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_total_tokens == 351_434
+    assert snapshot_entry.codex_cached_input_tokens == 300_672
+    assert snapshot_entry.codex_effective_tokens == 50_762
+    assert snapshot_entry.codex_last_effective_token_delta == 50_762
+
+    send(pid, {:DOWN, process_ref, :process, self(), :normal})
+    completed_state = :sys.get_state(pid)
+
+    assert completed_state.codex_totals.total_tokens == 351_434
+    assert completed_state.codex_totals.cached_input_tokens == 300_672
+    assert completed_state.codex_totals.effective_tokens == 50_762
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 

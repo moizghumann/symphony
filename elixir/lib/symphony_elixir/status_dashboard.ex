@@ -308,7 +308,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp snapshot_with_samples(token_samples, now_ms) do
     case snapshot_payload() do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
-        total_tokens = Map.get(codex_totals, :total_tokens, 0)
+        total_tokens = Map.get(codex_totals, :effective_tokens, Map.get(codex_totals, :total_tokens, 0))
 
         {
           {:ok,
@@ -337,8 +337,10 @@ defmodule SymphonyElixir.StatusDashboard do
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
+        codex_cached_input_tokens = Map.get(codex_totals, :cached_input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
+        codex_effective_tokens = Map.get(codex_totals, :effective_tokens, codex_total_tokens)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
         max_agents = Config.settings!().agent.max_concurrent_agents
@@ -356,12 +358,17 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
-           colorize("│ Tokens: ", @ansi_bold) <>
+           colorize("│ Effective tokens: ", @ansi_bold) <>
+             colorize(format_count(codex_effective_tokens), @ansi_green) <>
+             colorize(" | ", @ansi_gray) <>
+             colorize("gross context #{format_count(codex_total_tokens)}", @ansi_yellow) <>
+             colorize(" | ", @ansi_gray) <>
+             colorize("cached input #{format_count(codex_cached_input_tokens)}", @ansi_yellow) <>
+             colorize(" | ", @ansi_gray) <>
              colorize("in #{format_count(codex_input_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
              colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
-             colorize(" | ", @ansi_gray) <>
-             colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
+             "",
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
@@ -593,14 +600,14 @@ defmodule SymphonyElixir.StatusDashboard do
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
-    total_tokens = running_entry.codex_total_tokens || 0
+    effective_tokens = Map.get(running_entry, :codex_effective_tokens, running_entry.codex_total_tokens || 0)
     runtime_seconds = running_entry.runtime_seconds || 0
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
     event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
 
-    tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
+    tokens = format_count(effective_tokens) |> format_cell(@running_tokens_width, :right)
 
     status_color =
       case event do
@@ -743,11 +750,12 @@ defmodule SymphonyElixir.StatusDashboard do
         format_cell("STAGE", @running_stage_width),
         format_cell("PID", @running_pid_width),
         format_cell("AGE / TURN", @running_age_width),
-        format_cell("TOKENS", @running_tokens_width),
+        format_cell("EFFECTIVE", @running_tokens_width),
         format_cell("SESSION", @running_session_width),
         format_cell("EVENT", running_event_width)
       ]
       |> Enum.join(" ")
+      |> String.trim_trailing()
 
     "│   " <> colorize(header, @ansi_gray)
   end
@@ -1046,7 +1054,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp snapshot_total_tokens({:ok, %{codex_totals: codex_totals}}) when is_map(codex_totals) do
-    Map.get(codex_totals, :total_tokens, 0)
+    Map.get(codex_totals, :effective_tokens, Map.get(codex_totals, :total_tokens, 0))
   end
 
   defp snapshot_total_tokens(_snapshot_data), do: 0
