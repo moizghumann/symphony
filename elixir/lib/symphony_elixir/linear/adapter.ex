@@ -46,12 +46,21 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
   def post_handoff_comment(%Issue{id: issue_id}, body) when is_binary(issue_id) and is_binary(body) do
     issue_id
-    |> Lifecycle.post_handoff(body, graphql: graphql_fun())
+    |> post_handoff_comment_result(body)
     |> ok_result()
   end
 
   def post_handoff_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     create_comment(issue_id, body)
+  end
+
+  @spec post_handoff_comment_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
+  def post_handoff_comment_result(%Issue{id: issue_id}, body) when is_binary(issue_id) and is_binary(body) do
+    post_handoff_comment_result(issue_id, body)
+  end
+
+  def post_handoff_comment_result(issue_id, body) when is_binary(issue_id) and is_binary(body) do
+    Lifecycle.post_handoff(issue_id, body, graphql: graphql_fun())
   end
 
   defp client_module do

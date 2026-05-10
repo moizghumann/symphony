@@ -153,7 +153,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          timestamp: now,
          tool_name: "linear_post_handoff",
          tool_arguments: %{issue_id: issue_id, body: "handoff"},
-         tool_result: %{"success" => true}
+         tool_result: %{"success" => true, "comment_id" => "comment-life"}
        }}
     )
 
@@ -174,6 +174,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert running.linear_lifecycle.generic_graphql_calls == 0
     assert running.linear_lifecycle.narrow_tool_calls == 2
+    assert running.linear_lifecycle.handoff_comment_id == "comment-life"
 
     assert running.linear_lifecycle.issue_state_transitions == [
              %{tool: "linear_move_to_human_review", to: "Human Review", success: true}

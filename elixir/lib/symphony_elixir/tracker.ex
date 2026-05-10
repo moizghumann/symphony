@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Tracker do
   @callback move_issue_to_state(term(), String.t()) :: :ok | {:error, term()}
   @callback move_issue_to_blocked(term()) :: :ok | {:error, term()}
   @callback post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
+  @callback post_handoff_comment_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -52,6 +53,11 @@ defmodule SymphonyElixir.Tracker do
   @spec post_handoff_comment(term(), String.t()) :: :ok | {:error, term()}
   def post_handoff_comment(issue_or_id, body) do
     adapter().post_handoff_comment(issue_or_id, body)
+  end
+
+  @spec post_handoff_comment_result(term(), String.t()) :: {:ok, map()} | {:error, term()}
+  def post_handoff_comment_result(issue_or_id, body) do
+    adapter().post_handoff_comment_result(issue_or_id, body)
   end
 
   @spec adapter() :: module()

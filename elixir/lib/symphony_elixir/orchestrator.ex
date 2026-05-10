@@ -1369,6 +1369,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp tool_result_payload(%{tool_result: result}) when is_map(result), do: result
+
   defp tool_result_payload(_update), do: %{}
 
   defp append_trace_entry(entries, entry) when is_list(entries) do

@@ -153,10 +153,10 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp post_handoff(%Issue{} = issue, pr_url, opts) when is_binary(pr_url) do
     body = handoff_comment(issue, pr_url)
-    result = Tracker.post_handoff_comment(issue, body)
+    result = Tracker.post_handoff_comment_result(issue, body)
 
     record_lifecycle_call(opts, "linear_post_handoff", %{issue_id: issue.id, body: body}, result)
-    result
+    normalize_lifecycle_result(result)
   end
 
   defp move_to_human_review(%Issue{} = issue, opts) do
@@ -183,13 +183,26 @@ defmodule SymphonyElixir.GitHubHandoff do
         recorder.(%{
           tool_name: tool_name,
           tool_arguments: arguments,
-          tool_result: %{"success" => result == :ok}
+          tool_result: lifecycle_tool_result(result)
         })
 
       _ ->
         :ok
     end
   end
+
+  defp normalize_lifecycle_result(:ok), do: :ok
+  defp normalize_lifecycle_result({:ok, _payload}), do: :ok
+  defp normalize_lifecycle_result({:error, reason}), do: {:error, reason}
+
+  defp lifecycle_tool_result(:ok), do: %{"success" => true}
+
+  defp lifecycle_tool_result({:ok, %{comment_id: comment_id}}) when is_binary(comment_id) do
+    %{"success" => true, "comment_id" => comment_id}
+  end
+
+  defp lifecycle_tool_result({:ok, _payload}), do: %{"success" => true}
+  defp lifecycle_tool_result(_result), do: %{"success" => false}
 
   defp commit_message(%Issue{identifier: identifier, title: title}) do
     [identifier, title]
