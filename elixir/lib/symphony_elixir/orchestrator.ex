@@ -7,11 +7,13 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
+  alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{AgentRunner, Config, JobPacket, LaneClassifier, LanePolicy, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @handoff_ready_marker "SYMPHONY_HANDOFF_READY"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -767,11 +769,17 @@ defmodule SymphonyElixir.Orchestrator do
             effective_tokens_remaining: lane_policy.effective_token_budget,
             turn_budget: lane_policy.max_turns,
             tool_call_budget: lane_policy.max_tool_calls,
-            tool_call_count: 1,
-            tool_call_counts: Map.put(@empty_tool_call_counts, :linear_narrow, 1),
-            linear_generic_graphql_calls: [],
+            tool_call_count: initial_tool_call_count(issue),
+            tool_call_counts: initial_tool_call_counts(issue),
             budget_state: :ok,
             finalization_reason: nil,
+            handoff_ready: false,
+            linear_generic_graphql_calls: 0,
+            linear_narrow_tool_calls: initial_linear_narrow_tool_calls(issue),
+            generic_graphql_fallback_reasons: [],
+            issue_state_transitions: initial_issue_state_transitions(issue),
+            handoff_comment_id: nil,
+            blocked_reason: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1115,7 +1123,7 @@ defmodule SymphonyElixir.Orchestrator do
     if normalize_issue_state(state_name) == "todo" do
       case Tracker.move_issue_to_state(issue, "In Progress") do
         :ok ->
-          {:ok, %{issue | state: "In Progress"}}
+          {:ok, %{issue | state: "In Progress", orchestrator_lifecycle_events: [orchestrator_transition("Todo", "In Progress", true)]}}
 
         {:error, reason} ->
           {:error, reason}
@@ -1123,6 +1131,28 @@ defmodule SymphonyElixir.Orchestrator do
     else
       {:ok, issue}
     end
+  end
+
+  defp orchestrator_transition(from, to, success) do
+    %{
+      tool: "orchestrator_move_to_in_progress",
+      owner: "orchestrator",
+      from: from,
+      to: to,
+      success: success
+    }
+  end
+
+  defp initial_issue_state_transitions(%Issue{orchestrator_lifecycle_events: events}) when is_list(events),
+    do: events
+
+  defp initial_issue_state_transitions(_issue), do: []
+
+  defp initial_linear_narrow_tool_calls(issue), do: length(initial_issue_state_transitions(issue))
+  defp initial_tool_call_count(issue), do: initial_linear_narrow_tool_calls(issue)
+
+  defp initial_tool_call_counts(issue) do
+    Map.put(@empty_tool_call_counts, :linear_narrow, initial_linear_narrow_tool_calls(issue))
   end
 
   defp compile_lane_job(%Issue{} = issue) do
@@ -1216,13 +1246,17 @@ defmodule SymphonyElixir.Orchestrator do
           tool_call_count: Map.get(metadata, :tool_call_count, 0),
           tool_call_budget: Map.get(metadata, :tool_call_budget),
           tool_call_counts: Map.get(metadata, :tool_call_counts, @empty_tool_call_counts),
-          linear_generic_graphql_calls: Map.get(metadata, :linear_generic_graphql_calls, []),
-          linear_narrow_tool_calls: get_in(metadata, [:tool_call_counts, :linear_narrow]) || 0,
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          linear_generic_graphql_calls: Map.get(metadata, :linear_generic_graphql_calls, 0),
+          linear_narrow_tool_calls: Map.get(metadata, :linear_narrow_tool_calls, 0),
+          generic_graphql_fallback_reasons: Map.get(metadata, :generic_graphql_fallback_reasons, []),
+          issue_state_transitions: Map.get(metadata, :issue_state_transitions, []),
+          handoff_comment_id: Map.get(metadata, :handoff_comment_id),
+          blocked_reason: Map.get(metadata, :blocked_reason),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1284,6 +1318,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     last_reported_effective = Map.get(running_entry, :codex_last_reported_effective_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    linear_tool_metadata = linear_tool_metadata_for_update(running_entry, update)
 
     {
       Map.merge(running_entry, %{
@@ -1303,8 +1338,10 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         codex_last_reported_effective_tokens: max(last_reported_effective, token_delta.effective_reported),
+        handoff_ready: Map.get(running_entry, :handoff_ready, false) or handoff_ready_update?(update),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
+      })
+      |> Map.merge(linear_tool_metadata),
       token_delta
     }
   end
@@ -1332,7 +1369,6 @@ defmodule SymphonyElixir.Orchestrator do
         running_entry
         |> Map.put(:tool_call_counts, counts)
         |> Map.update(:tool_call_count, 1, &(&1 + 1))
-        |> maybe_record_linear_graphql_call(update, category)
     end
   end
 
@@ -1379,13 +1415,19 @@ defmodule SymphonyElixir.Orchestrator do
     reason = Map.get(running_entry, :finalization_reason) || "budget exceeded"
     issue = Map.get(running_entry, :issue)
 
-    Logger.warning("Stopping issue after budget exceeded: issue_id=#{issue_id} reason=#{reason}")
-    _ = Tracker.post_handoff_comment(issue, budget_blocker_comment(running_entry, reason))
-    _ = Tracker.move_issue_to_blocked(issue)
+    if reviewable_handoff_ready?(running_entry) do
+      Logger.warning("Issue exceeded lane budget after reviewable handoff was available: issue_id=#{issue_id} reason=#{reason}; allowing minimal handoff completion")
 
-    state
-    |> terminate_running_issue(issue_id, false)
-    |> complete_issue(issue_id)
+      state
+    else
+      Logger.warning("Stopping issue after budget exceeded: issue_id=#{issue_id} reason=#{reason}")
+      _ = Tracker.post_handoff_comment(issue, budget_blocker_comment(running_entry, reason))
+      _ = Tracker.move_issue_to_blocked(issue)
+
+      state
+      |> terminate_running_issue(issue_id, false)
+      |> complete_issue(issue_id)
+    end
   end
 
   defp maybe_enforce_budget_limit(state, _issue_id, _running_entry), do: state
@@ -1428,27 +1470,172 @@ defmodule SymphonyElixir.Orchestrator do
     Lane: #{Map.get(running_entry, :lane, "unknown")}
     Effective tokens: #{Map.get(running_entry, :codex_effective_tokens, 0)}/#{Map.get(running_entry, :effective_tokens_budget, "n/a")}
     Tool calls: #{Map.get(running_entry, :tool_call_count, 0)}/#{Map.get(running_entry, :tool_call_budget, "n/a")}
-    Generic Linear GraphQL calls: #{length(Map.get(running_entry, :linear_generic_graphql_calls, []))}
+    Generic Linear GraphQL calls: #{Map.get(running_entry, :linear_generic_graphql_calls, 0)}
     """
   end
 
-  defp maybe_record_linear_graphql_call(running_entry, update, :linear_generic_graphql) do
-    call = %{
-      reason: "fallback/debug dynamic tool call",
-      operation: graphql_operation(update),
-      narrow_helper_existed: true,
-      narrow_helper_failed: false
-    }
-
-    Map.update(running_entry, :linear_generic_graphql_calls, [call], &(&1 ++ [call]))
+  defp reviewable_handoff_ready?(running_entry) do
+    Map.get(running_entry, :handoff_ready) == true or
+      is_binary(Map.get(running_entry, :handoff_comment_id)) or
+      successful_human_review_transition?(Map.get(running_entry, :issue_state_transitions, []))
   end
 
-  defp maybe_record_linear_graphql_call(running_entry, _update, _category), do: running_entry
+  defp handoff_ready_update?(update) do
+    update
+    |> handoff_ready_values()
+    |> Enum.any?(fn
+      value when is_binary(value) -> String.contains?(value, @handoff_ready_marker)
+      _ -> false
+    end)
+  end
 
-  defp tool_call_category(%{event: event} = update) when event in [:tool_call_completed, :tool_call_failed, :unsupported_tool_call] do
-    case tool_call_name_from_update(update) do
-      "linear_graphql" -> :linear_generic_graphql
-      _ -> :other
+  defp handoff_ready_values(value) when is_map(value) do
+    value
+    |> Map.values()
+    |> Enum.flat_map(&handoff_ready_values/1)
+  end
+
+  defp handoff_ready_values(value) when is_list(value), do: Enum.flat_map(value, &handoff_ready_values/1)
+  defp handoff_ready_values(value) when is_binary(value), do: [value]
+  defp handoff_ready_values(_value), do: []
+
+  defp successful_human_review_transition?(transitions) when is_list(transitions) do
+    Enum.any?(transitions, fn
+      %{to: "Human Review", success: true} -> true
+      %{"to" => "Human Review", "success" => true} -> true
+      _ -> false
+    end)
+  end
+
+  defp successful_human_review_transition?(_transitions), do: false
+
+  defp linear_tool_metadata_for_update(running_entry, %{tool_name: tool_name} = update)
+       when is_binary(tool_name) do
+    cond do
+      tool_name == DynamicTool.linear_graphql_tool_name() ->
+        %{
+          linear_generic_graphql_calls: Map.get(running_entry, :linear_generic_graphql_calls, 0) + 1,
+          generic_graphql_fallback_reasons:
+            running_entry
+            |> Map.get(:generic_graphql_fallback_reasons, [])
+            |> append_trace_entry(generic_graphql_fallback_reason(running_entry, update))
+        }
+
+      tool_name in DynamicTool.linear_narrow_tool_names() ->
+        running_entry
+        |> narrow_linear_tool_metadata(update)
+        |> Map.put(:linear_narrow_tool_calls, Map.get(running_entry, :linear_narrow_tool_calls, 0) + 1)
+
+      true ->
+        %{}
+    end
+  end
+
+  defp linear_tool_metadata_for_update(_running_entry, _update), do: %{}
+
+  defp narrow_linear_tool_metadata(running_entry, update) do
+    tool_name = update[:tool_name]
+    metadata = %{}
+
+    metadata =
+      case narrow_state_transition(update) do
+        nil ->
+          metadata
+
+        transition ->
+          Map.put(
+            metadata,
+            :issue_state_transitions,
+            append_trace_entry(Map.get(running_entry, :issue_state_transitions, []), transition)
+          )
+      end
+
+    metadata =
+      if tool_name in ["linear_post_handoff", "linear_attach_pr"] do
+        case tool_result_payload(update)["comment_id"] do
+          comment_id when is_binary(comment_id) -> Map.put(metadata, :handoff_comment_id, comment_id)
+          _ -> metadata
+        end
+      else
+        metadata
+      end
+
+    if tool_name == "linear_post_blocker" do
+      Map.put(metadata, :blocked_reason, tool_argument(update, "body"))
+    else
+      metadata
+    end
+  end
+
+  defp narrow_state_transition(%{tool_name: "linear_move_state"} = update) do
+    %{tool: "linear_move_state", to: tool_argument(update, "state_name"), success: tool_success?(update)}
+  end
+
+  defp narrow_state_transition(%{tool_name: "linear_move_to_in_progress"} = update),
+    do: %{tool: "linear_move_to_in_progress", to: "In Progress", success: tool_success?(update)}
+
+  defp narrow_state_transition(%{tool_name: "linear_move_to_human_review"} = update),
+    do: %{tool: "linear_move_to_human_review", to: "Human Review", success: tool_success?(update)}
+
+  defp narrow_state_transition(%{tool_name: "linear_move_to_blocked"} = update),
+    do: %{tool: "linear_move_to_blocked", to: "Blocked", success: tool_success?(update)}
+
+  defp narrow_state_transition(_update), do: nil
+
+  defp generic_graphql_fallback_reason(running_entry, update) do
+    %{
+      reason: tool_argument(update, "reason") || "unspecified",
+      operation: tool_argument(update, "operation") || infer_graphql_operation(tool_argument(update, "query")),
+      issue_identifier: Map.get(running_entry, :identifier),
+      narrow_tool_existed: tool_argument(update, "narrow_tool_existed"),
+      narrow_tool_failed: tool_argument(update, "narrow_tool_failed")
+    }
+  end
+
+  defp infer_graphql_operation(query) when is_binary(query) do
+    query
+    |> String.split(~r/\s+/, trim: true)
+    |> Enum.take(2)
+    |> Enum.join(" ")
+  end
+
+  defp infer_graphql_operation(_query), do: "unspecified"
+
+  defp tool_argument(%{tool_arguments: args}, key) when is_map(args) do
+    cond do
+      Map.has_key?(args, key) -> Map.get(args, key)
+      Map.has_key?(args, String.to_atom(key)) -> Map.get(args, String.to_atom(key))
+      true -> nil
+    end
+  end
+
+  defp tool_argument(_update, _key), do: nil
+
+  defp tool_success?(%{tool_result: %{"success" => success}}) when is_boolean(success), do: success
+  defp tool_success?(_update), do: false
+
+  defp tool_result_payload(%{tool_result: %{"output" => output}}) when is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, payload} when is_map(payload) -> payload
+      _ -> %{}
+    end
+  end
+
+  defp tool_result_payload(%{tool_result: result}) when is_map(result), do: result
+
+  defp tool_result_payload(_update), do: %{}
+
+  defp append_trace_entry(entries, entry) when is_list(entries) do
+    entries
+    |> Kernel.++([entry])
+    |> Enum.take(-20)
+  end
+
+  defp tool_call_category(%{tool_name: tool_name}) when is_binary(tool_name) do
+    cond do
+      tool_name == DynamicTool.linear_graphql_tool_name() -> :linear_generic_graphql
+      tool_name in DynamicTool.linear_narrow_tool_names() -> :linear_narrow
+      true -> :other
     end
   end
 
@@ -1476,38 +1663,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp update_method(update) do
     payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
     Map.get(payload, "method") || Map.get(payload, :method)
-  end
-
-  defp tool_call_name_from_update(update) do
-    payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
-    params = Map.get(payload, "params") || Map.get(payload, :params) || %{}
-    Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name)
-  end
-
-  defp graphql_operation(update) do
-    query =
-      update
-      |> tool_arguments_from_update()
-      |> then(fn arguments -> Map.get(arguments, "query") || Map.get(arguments, :query) end)
-
-    case query do
-      query when is_binary(query) ->
-        query
-        |> String.trim()
-        |> String.split(~r/\s+/, parts: 3)
-        |> Enum.take(2)
-        |> Enum.join(" ")
-
-      _ ->
-        "unknown"
-    end
-  end
-
-  defp tool_arguments_from_update(update) do
-    payload = Map.get(update, :payload) || Map.get(update, "payload") || %{}
-    params = Map.get(payload, "params") || Map.get(payload, :params) || %{}
-    arguments = Map.get(params, "arguments") || Map.get(params, :arguments) || %{}
-    if is_map(arguments), do: arguments, else: %{}
   end
 
   defp command_text(update) do

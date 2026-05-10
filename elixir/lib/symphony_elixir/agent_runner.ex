@@ -50,7 +50,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
-      record_handoff_ready(message)
+      record_handoff_ready(message, issue)
       send_codex_update(recipient, issue, message)
     end
   end
@@ -115,7 +115,8 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(turn_context.codex_update_recipient, issue)
+             on_message: codex_message_handler(turn_context.codex_update_recipient, issue),
+             linear_lifecycle_graphql: Keyword.get(turn_context.opts, :linear_lifecycle_graphql)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{turn_context.workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -125,7 +126,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_after_turn(issue, app_session, turn_context, turn_number, max_turns, handoff_ready) do
     if handoff_ready do
-      complete_handoff(turn_context.workspace, issue, turn_context.worker_host)
+      complete_handoff(turn_context.workspace, issue, turn_context.worker_host, turn_context.codex_update_recipient)
     else
       continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns)
     end
@@ -161,8 +162,8 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp complete_handoff(workspace, issue, worker_host) do
-    case GitHubHandoff.complete(workspace, issue, worker_host) do
+  defp complete_handoff(workspace, issue, worker_host, codex_update_recipient) do
+    case GitHubHandoff.complete(workspace, issue, worker_host, lifecycle_recorder: lifecycle_recorder(codex_update_recipient, issue)) do
       {:ok, pr_url} ->
         Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
         :ok
@@ -192,6 +193,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp lane_name(%Issue{lane_classification: %{lane: lane}}), do: lane
   defp lane_name(_issue), do: "unknown"
+
+  defp lifecycle_recorder(recipient, %Issue{id: issue_id}) when is_binary(issue_id) and is_pid(recipient) do
+    fn lifecycle_event ->
+      send(
+        recipient,
+        {:codex_worker_update, issue_id,
+         lifecycle_event
+         |> Map.put(:event, :linear_lifecycle_call)
+         |> Map.put(:timestamp, DateTime.utc_now())}
+      )
+    end
+  end
+
+  defp lifecycle_recorder(_recipient, _issue), do: fn _lifecycle_event -> :ok end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
@@ -230,8 +245,8 @@ defmodule SymphonyElixir.AgentRunner do
     Process.put({__MODULE__, :handoff_ready}, false)
   end
 
-  defp record_handoff_ready(message) do
-    if handoff_ready_message?(message) do
+  defp record_handoff_ready(message, issue) do
+    if handoff_ready_message?(message) or research_linear_handoff_complete?(message, issue) do
       Process.put({__MODULE__, :handoff_ready}, true)
     end
   end
@@ -254,6 +269,36 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handoff_ready_message?(_message), do: false
+
+  defp research_linear_handoff_complete?(message, %Issue{lane_classification: %{lane: :research}}) do
+    linear_human_review_success_message?(message)
+  end
+
+  defp research_linear_handoff_complete?(_message, _issue), do: false
+
+  defp linear_human_review_success_message?(%{event: event} = message)
+       when event in [:tool_call_completed, :linear_lifecycle_call] do
+    tool_name = Map.get(message, :tool_name) || Map.get(message, "tool_name")
+    result = Map.get(message, :tool_result) || Map.get(message, "tool_result") || %{}
+
+    tool_name == "linear_move_to_human_review" and tool_result_success?(result)
+  end
+
+  defp linear_human_review_success_message?(%_{}), do: false
+
+  defp linear_human_review_success_message?(message) when is_map(message) do
+    Enum.any?(message, fn {_key, value} -> linear_human_review_success_message?(value) end)
+  end
+
+  defp linear_human_review_success_message?(message) when is_list(message) do
+    Enum.any?(message, &linear_human_review_success_message?/1)
+  end
+
+  defp linear_human_review_success_message?(_message), do: false
+
+  defp tool_result_success?(%{"success" => true}), do: true
+  defp tool_result_success?(%{success: true}), do: true
+  defp tool_result_success?(_result), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

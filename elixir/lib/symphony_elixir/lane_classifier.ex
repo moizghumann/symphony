@@ -57,14 +57,19 @@ defmodule SymphonyElixir.LaneClassifier do
         if matched == [], do: [], else: [{lane, matched}]
       end)
 
-    case matches do
-      [] ->
+    cond do
+      matches == [] ->
         classification(:research, "no deterministic lane signal matched; defaulted to research", [], 0.3)
 
-      [{lane, matched_signals}] ->
+      research_explicit?(text) ->
+        {_lane, matched_signals} = Enum.find(matches, fn {lane, _signals} -> lane == :research end)
+        classification(:research, "matched explicit read-only research signal", matched_signals, 0.9)
+
+      match?([{_lane, _matched_signals}], matches) ->
+        [{lane, matched_signals}] = matches
         classification(lane, "matched #{lane} signal", matched_signals, 0.8)
 
-      _ ->
+      true ->
         {lane, matched_signals} = least_expensive_safe_match(matches)
         other_lanes = matches |> Enum.map(&elem(&1, 0)) |> Enum.reject(&(&1 == lane)) |> Enum.uniq()
 
@@ -145,6 +150,12 @@ defmodule SymphonyElixir.LaneClassifier do
     else
       Regex.match?(~r/(^|[^a-z0-9])#{Regex.escape(normalized)}([^a-z0-9]|$)/, text)
     end
+  end
+
+  defp research_explicit?(text) when is_binary(text) do
+    signal_match?(text, "investigate") and
+      (String.contains?(text, "read-only") or String.contains?(text, "no code changes") or
+         String.contains?(text, "post findings"))
   end
 
   defp classification(lane, reason, matched_signals, confidence) do

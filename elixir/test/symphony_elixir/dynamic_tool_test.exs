@@ -2,22 +2,33 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Linear.Issue
 
-  test "tool_specs advertises the linear_graphql input contract" do
-    assert [
-             %{
-               "description" => description,
-               "inputSchema" => %{
-                 "properties" => %{
-                   "query" => _,
-                   "variables" => _
-                 },
-                 "required" => ["query"],
-                 "type" => "object"
+  test "tool_specs advertises narrow Linear lifecycle helpers and linear_graphql fallback" do
+    specs = DynamicTool.tool_specs()
+    tool_names = Enum.map(specs, & &1["name"])
+
+    assert "linear_move_state" in tool_names
+    assert "linear_move_to_in_progress" in tool_names
+    assert "linear_move_to_human_review" in tool_names
+    assert "linear_move_to_blocked" in tool_names
+    assert "linear_post_comment" in tool_names
+    assert "linear_post_handoff" in tool_names
+    assert "linear_post_blocker" in tool_names
+    assert "linear_attach_pr" in tool_names
+
+    assert %{
+             "description" => description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "query" => _,
+                 "variables" => _
                },
-               "name" => "linear_graphql"
-             }
-           ] = DynamicTool.tool_specs()
+               "required" => ["query"],
+               "type" => "object"
+             },
+             "name" => "linear_graphql"
+           } = Enum.find(specs, &(&1["name"] == "linear_graphql"))
 
     assert description =~ "Linear"
   end
@@ -30,7 +41,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => Enum.map(DynamicTool.tool_specs(), & &1["name"])
              }
            }
 
@@ -40,6 +51,108 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
+  end
+
+  test "linear_move_to_human_review uses resolved issue state ids without lookup" do
+    test_pid = self()
+
+    issue = %Issue{
+      id: "issue-1",
+      available_states: [%{id: "state-human-review", name: "Human Review"}]
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_move_to_human_review",
+        %{"issue_id" => "issue-1"},
+        issue: issue,
+        linear_lifecycle_graphql: fn query, variables ->
+          send(test_pid, {:linear_lifecycle_graphql_called, query, variables})
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        end
+      )
+
+    assert_received {:linear_lifecycle_graphql_called, query, %{issueId: "issue-1", stateId: "state-human-review"}}
+
+    assert query =~ "issueUpdate"
+    refute query =~ "states("
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["state"] == "Human Review"
+  end
+
+  test "linear_move_state fails clearly when target state is absent from resolved state map" do
+    issue = %Issue{
+      id: "issue-1",
+      available_states: [%{id: "state-todo", name: "Todo"}]
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_move_state",
+        %{"issue_id" => "issue-1", "state_name" => "Human Review"},
+        issue: issue,
+        linear_lifecycle_graphql: fn _query, _variables ->
+          flunk("state mutation should not run when the state id is unresolved")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "available_states" => ["Todo"],
+               "code" => "state_not_found",
+               "message" => "Requested Linear state was not found in the resolved state map.",
+               "requested_state" => "Human Review"
+             }
+           }
+  end
+
+  test "linear_post_handoff returns the created comment id" do
+    test_pid = self()
+    issue = %Issue{id: "issue-1"}
+
+    response =
+      DynamicTool.execute(
+        "linear_post_handoff",
+        %{"issue_id" => "issue-1", "body" => "Ready for review"},
+        issue: issue,
+        linear_lifecycle_graphql: fn query, variables ->
+          send(test_pid, {:linear_lifecycle_graphql_called, query, variables})
+
+          {:ok,
+           %{
+             "data" => %{
+               "commentCreate" => %{"success" => true, "comment" => %{"id" => "comment-1"}}
+             }
+           }}
+        end
+      )
+
+    assert_received {:linear_lifecycle_graphql_called, query, %{issueId: "issue-1", body: "Ready for review"}}
+
+    assert query =~ "commentCreate"
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["comment_id"] == "comment-1"
+  end
+
+  test "narrow Linear tools can only operate on the current issue" do
+    response =
+      DynamicTool.execute(
+        "linear_move_to_blocked",
+        %{"issue_id" => "other-issue"},
+        issue: %Issue{id: "issue-1"}
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "current_issue_id" => "issue-1",
+               "message" => "Linear lifecycle tools can only operate on the current issue.",
+               "requested_issue_id" => "other-issue"
+             }
+           }
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

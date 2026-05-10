@@ -110,6 +110,8 @@ Codex owns repository work only: inspect, edit when allowed, validate, commit, p
 
 When repository work is complete, committed, pushed, and validated according to the lane policy, finish with the exact marker `SYMPHONY_HANDOFF_READY`.
 
+Research lane exception: if the packet says no repository artifact is required, do not create a branch/commit/PR and do not emit `SYMPHONY_HANDOFF_READY`. Post concise findings with `linear_post_handoff`, then move the issue to `Human Review` with `linear_move_to_human_review`. If findings cannot be posted, use `linear_post_blocker` and move to `Blocked`.
+
 {% if attempt %}
 Continuation attempt #{{ attempt }}:
 

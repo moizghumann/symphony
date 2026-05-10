@@ -377,6 +377,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "tool_call_budget" => nil,
                  "linear_generic_graphql_calls" => 0,
                  "linear_narrow_tool_calls" => 0,
+                 "generic_graphql_fallback_reasons" => [],
+                 "issue_state_transitions" => [],
+                 "handoff_comment_id" => nil,
+                 "blocked_reason" => nil,
                  "budget_state" => "ok",
                  "finalization_reason" => nil,
                  "last_event" => "notification",
@@ -395,6 +399,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "output_tokens_total" => 7,
                    "cached_input_tokens_total" => 40,
                    "total_tokens" => 120
+                 },
+                 "linear_lifecycle" => %{
+                   "blocked_reason" => nil,
+                   "generic_graphql_calls" => 0,
+                   "generic_graphql_fallback_reasons" => [],
+                   "handoff_comment_id" => nil,
+                   "issue_state_transitions" => [],
+                   "narrow_tool_calls" => 0
                  }
                }
              ],
@@ -451,6 +463,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tool_call_budget" => nil,
                "linear_generic_graphql_calls" => 0,
                "linear_narrow_tool_calls" => 0,
+               "generic_graphql_fallback_reasons" => [],
+               "issue_state_transitions" => [],
+               "handoff_comment_id" => nil,
+               "blocked_reason" => nil,
                "budget_state" => "ok",
                "finalization_reason" => nil,
                "state" => "In Progress",
@@ -470,6 +486,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "output_tokens_total" => 7,
                  "cached_input_tokens_total" => 40,
                  "total_tokens" => 120
+               },
+               "linear_lifecycle" => %{
+                 "blocked_reason" => nil,
+                 "generic_graphql_calls" => 0,
+                 "generic_graphql_fallback_reasons" => [],
+                 "handoff_comment_id" => nil,
+                 "issue_state_transitions" => [],
+                 "narrow_tool_calls" => 0
                }
              },
              "retry" => nil,

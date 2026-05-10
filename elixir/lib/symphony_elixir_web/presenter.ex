@@ -111,8 +111,12 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_budget: Map.get(entry, :turn_budget),
       tool_call_count: Map.get(entry, :tool_call_count, 0),
       tool_call_budget: Map.get(entry, :tool_call_budget),
-      linear_generic_graphql_calls: length(Map.get(entry, :linear_generic_graphql_calls, [])),
+      linear_generic_graphql_calls: Map.get(entry, :linear_generic_graphql_calls, 0),
       linear_narrow_tool_calls: Map.get(entry, :linear_narrow_tool_calls, 0),
+      generic_graphql_fallback_reasons: Map.get(entry, :generic_graphql_fallback_reasons, []),
+      issue_state_transitions: Map.get(entry, :issue_state_transitions, []),
+      handoff_comment_id: Map.get(entry, :handoff_comment_id),
+      blocked_reason: Map.get(entry, :blocked_reason),
       budget_state: Map.get(entry, :budget_state, :ok),
       finalization_reason: Map.get(entry, :finalization_reason),
       last_event: entry.last_codex_event,
@@ -131,6 +135,14 @@ defmodule SymphonyElixirWeb.Presenter do
         gross_context_tokens_total: entry.codex_total_tokens,
         cached_input_tokens_total: Map.get(entry, :codex_cached_input_tokens, 0),
         output_tokens_total: entry.codex_output_tokens
+      },
+      linear_lifecycle: %{
+        generic_graphql_calls: Map.get(entry, :linear_generic_graphql_calls, 0),
+        narrow_tool_calls: Map.get(entry, :linear_narrow_tool_calls, 0),
+        generic_graphql_fallback_reasons: Map.get(entry, :generic_graphql_fallback_reasons, []),
+        issue_state_transitions: Map.get(entry, :issue_state_transitions, []),
+        handoff_comment_id: Map.get(entry, :handoff_comment_id),
+        blocked_reason: Map.get(entry, :blocked_reason)
       }
     }
   end
@@ -160,8 +172,12 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_budget: Map.get(running, :turn_budget),
       tool_call_count: Map.get(running, :tool_call_count, 0),
       tool_call_budget: Map.get(running, :tool_call_budget),
-      linear_generic_graphql_calls: length(Map.get(running, :linear_generic_graphql_calls, [])),
+      linear_generic_graphql_calls: Map.get(running, :linear_generic_graphql_calls, 0),
       linear_narrow_tool_calls: Map.get(running, :linear_narrow_tool_calls, 0),
+      generic_graphql_fallback_reasons: Map.get(running, :generic_graphql_fallback_reasons, []),
+      issue_state_transitions: Map.get(running, :issue_state_transitions, []),
+      handoff_comment_id: Map.get(running, :handoff_comment_id),
+      blocked_reason: Map.get(running, :blocked_reason),
       budget_state: Map.get(running, :budget_state, :ok),
       finalization_reason: Map.get(running, :finalization_reason),
       state: running.state,
@@ -181,6 +197,14 @@ defmodule SymphonyElixirWeb.Presenter do
         gross_context_tokens_total: running.codex_total_tokens,
         cached_input_tokens_total: Map.get(running, :codex_cached_input_tokens, 0),
         output_tokens_total: running.codex_output_tokens
+      },
+      linear_lifecycle: %{
+        generic_graphql_calls: Map.get(running, :linear_generic_graphql_calls, 0),
+        narrow_tool_calls: Map.get(running, :linear_narrow_tool_calls, 0),
+        generic_graphql_fallback_reasons: Map.get(running, :generic_graphql_fallback_reasons, []),
+        issue_state_transitions: Map.get(running, :issue_state_transitions, []),
+        handoff_comment_id: Map.get(running, :handoff_comment_id),
+        blocked_reason: Map.get(running, :blocked_reason)
       }
     }
   end
