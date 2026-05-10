@@ -73,7 +73,7 @@ Work only in the provided repository copy. Do not touch any other path.
 
 Symphony injects a compact Linear issue packet before this workflow prompt. Treat that packet as authoritative for issue id, identifier, title, description, URL, current state, project, team, and available state ids. The `linear_graphql` tool is a fallback only; do not use it to rediscover packet data.
 
-Codex owns repository work: edit, validate, commit, push, and summarize the completed change. Symphony owns deterministic issue plumbing after Codex has finished: create the draft PR, post the Linear handoff comment, and move the ticket to `Human Review` or `Blocked`. Do not create the PR manually unless the orchestrator explicitly asks for fallback help. The orchestrator PR path must use:
+Codex owns repository work: edit, validate, commit, push, and summarize the completed change. Symphony owns deterministic issue plumbing after Codex has finished: create the draft PR, post the Linear handoff comment, and move the ticket to `Human Review` or `Blocked`. When the branch is committed, pushed, validated, and ready for Symphony handoff, include the exact marker `SYMPHONY_HANDOFF_READY` in your final response. Do not create the PR manually unless the orchestrator explicitly asks for fallback help. The orchestrator PR path must use:
 
 ```bash
 gh pr create --draft --head <branch> --base main ...
@@ -233,7 +233,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then finish your Codex turn. Symphony moves the issue to `Human Review` only after a draft PR exists and its URL was posted to Linear.
+12. Only then finish your Codex turn with the exact marker `SYMPHONY_HANDOFF_READY` in the final response. Symphony moves the issue to `Human Review` only after a draft PR exists and its URL was posted to Linear.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.

@@ -1156,6 +1156,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "\"team\":{\"id\":\"team-1\",\"key\":\"MT\"}"
     assert prompt =~ "\"state_ids\":{\"Human Review\":\"state-review\",\"In Progress\":\"state-progress\",\"Todo\":\"state-todo\"}"
     assert prompt =~ "Do not use generic Linear GraphQL to rediscover"
+    assert prompt =~ "SYMPHONY_HANDOFF_READY"
   end
 
   test "github handoff creates draft PR with explicit head and moves issue after Linear comment" do
@@ -1774,7 +1775,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner does not invoke handoff between intermediate codex turns" do
+  test "agent runner hands off when codex signals completion while issue remains active" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1838,6 +1839,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-handoff-2"}}}'
+            printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1873,25 +1875,23 @@ defmodule SymphonyElixir.CoreTest do
 
         if attempt == 1 do
           refute File.exists?(gh_log)
-          send(parent, {:handoff_state_fetch, :intermediate})
-          {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "In Progress"}]}
-        else
-          send(parent, {:handoff_state_fetch, :terminal})
-          {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "Done"}]}
         end
+
+        send(parent, {:handoff_state_fetch, attempt})
+        {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "In Progress"}]}
       end
 
       issue = %Issue{
         id: "issue-terminal-handoff",
         identifier: "MT-249",
-        title: "Only hand off at terminal completion",
-        description: "Repo changes after first turn should not publish early",
+        title: "Hand off after Codex completion signal",
+        description: "Repo changes should publish after Codex signals completion",
         state: "In Progress"
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-      assert_receive {:handoff_state_fetch, :intermediate}
-      assert_receive {:handoff_state_fetch, :terminal}
+      assert_receive {:handoff_state_fetch, 1}
+      assert_receive {:handoff_state_fetch, 2}
       assert File.read!(gh_log) =~ "pr create --draft --head symphony/mt-249 --base main"
       assert_receive {:memory_tracker_comment, "issue-terminal-handoff", comment}
       assert comment =~ "https://github.com/example/repo/pull/249"
