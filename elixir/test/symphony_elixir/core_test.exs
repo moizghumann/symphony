@@ -1877,7 +1877,7 @@ defmodule SymphonyElixir.CoreTest do
           refute File.exists?(gh_log)
         end
 
-        send(parent, {:handoff_state_fetch, attempt})
+        send(parent, {:handoff_state_fetch, attempt, "In Progress"})
         {:ok, [%Issue{id: "issue-terminal-handoff", identifier: "MT-249", state: "In Progress"}]}
       end
 
@@ -1890,8 +1890,8 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-      assert_receive {:handoff_state_fetch, 1}
-      assert_receive {:handoff_state_fetch, 2}
+      assert_receive {:handoff_state_fetch, 1, "In Progress"}
+      refute_receive {:handoff_state_fetch, 2, _state}
       assert File.read!(gh_log) =~ "pr create --draft --head symphony/mt-249 --base main"
       assert_receive {:memory_tracker_comment, "issue-terminal-handoff", comment}
       assert comment =~ "https://github.com/example/repo/pull/249"

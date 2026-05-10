@@ -124,28 +124,22 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_after_turn(issue, app_session, turn_context, turn_number, max_turns, handoff_ready) do
+    if handoff_ready do
+      complete_handoff(turn_context.workspace, issue, turn_context.worker_host)
+    else
+      continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns)
+    end
+  end
+
+  defp continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns) do
     case continue_with_issue?(issue, turn_context.issue_state_fetcher) do
-      {:continue, refreshed_issue} when handoff_ready == true ->
-        complete_handoff(turn_context.workspace, refreshed_issue, turn_context.worker_host)
-
       {:continue, refreshed_issue} when turn_number < max_turns ->
-        Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-        do_run_codex_turns(
-          app_session,
-          refreshed_issue,
-          turn_context,
-          turn_number + 1,
-          max_turns
-        )
+        continue_codex_turn(app_session, refreshed_issue, turn_context, turn_number, max_turns)
 
       {:continue, refreshed_issue} ->
         Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
         :ok
-
-      {:done, refreshed_issue} when handoff_ready == true ->
-        complete_handoff(turn_context.workspace, refreshed_issue, turn_context.worker_host)
 
       {:done, _refreshed_issue} ->
         :ok
@@ -153,6 +147,18 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp continue_codex_turn(app_session, refreshed_issue, turn_context, turn_number, max_turns) do
+    Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+    do_run_codex_turns(
+      app_session,
+      refreshed_issue,
+      turn_context,
+      turn_number + 1,
+      max_turns
+    )
   end
 
   defp complete_handoff(workspace, issue, worker_host) do
