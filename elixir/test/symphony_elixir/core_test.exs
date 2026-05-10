@@ -1156,7 +1156,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "\"team\":{\"id\":\"team-1\",\"key\":\"MT\"}"
     assert prompt =~ "\"state_ids\":{\"Human Review\":\"state-review\",\"In Progress\":\"state-progress\",\"Todo\":\"state-todo\"}"
     assert prompt =~ "Do not call generic Linear GraphQL for normal lifecycle actions"
-    assert prompt =~ "Use the provided narrow Linear helpers"
+    assert prompt =~ "In the normal happy path, do not call handoff or Human Review helpers"
+    assert prompt =~ "Narrow Linear helpers are available for supported fallback/runtime lifecycle operations"
     assert prompt =~ "SYMPHONY_HANDOFF_READY"
   end
 
@@ -1890,13 +1891,28 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
       assert_receive {:handoff_state_fetch, 1, "In Progress"}
       refute_receive {:handoff_state_fetch, 2, _state}
       assert File.read!(gh_log) =~ "pr create --draft --head symphony/mt-249 --base main"
       assert_receive {:memory_tracker_comment, "issue-terminal-handoff", comment}
       assert comment =~ "https://github.com/example/repo/pull/249"
+
+      assert_receive {:codex_worker_update, "issue-terminal-handoff",
+                      %{
+                        event: :linear_lifecycle_call,
+                        tool_name: "linear_post_handoff",
+                        tool_result: %{"success" => true}
+                      }}
+
       assert_receive {:memory_tracker_state_update, "issue-terminal-handoff", "Human Review"}
+
+      assert_receive {:codex_worker_update, "issue-terminal-handoff",
+                      %{
+                        event: :linear_lifecycle_call,
+                        tool_name: "linear_move_to_human_review",
+                        tool_result: %{"success" => true}
+                      }}
     after
       File.rm_rf(test_root)
     end

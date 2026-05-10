@@ -14,15 +14,18 @@ defmodule SymphonyElixir.GitHubHandoff do
   def complete(workspace, issue), do: complete(workspace, issue, nil)
 
   @spec complete(Path.t(), Issue.t(), worker_host()) :: result()
-  def complete(workspace, %Issue{} = issue, worker_host) when is_binary(workspace) do
+  def complete(workspace, issue, worker_host), do: complete(workspace, issue, worker_host, [])
+
+  @spec complete(Path.t(), Issue.t(), worker_host(), keyword()) :: result()
+  def complete(workspace, %Issue{} = issue, worker_host, opts) when is_binary(workspace) and is_list(opts) do
     with :ok <- ensure_git_repo(workspace, worker_host),
          true <- repo_changing_ticket?(workspace, worker_host),
          {:ok, branch} <- ensure_branch(workspace, issue, worker_host),
          :ok <- ensure_committed(workspace, worker_host),
          :ok <- ensure_pushed(workspace, branch, worker_host),
          {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
-         :ok <- post_handoff(issue, pr_url),
-         :ok <- Tracker.move_issue_to_state(issue, "Human Review") do
+         :ok <- post_handoff(issue, pr_url, opts),
+         :ok <- move_to_human_review(issue, opts) do
       {:ok, pr_url}
     else
       false ->
@@ -32,12 +35,12 @@ defmodule SymphonyElixir.GitHubHandoff do
         :no_repo_changes
 
       {:error, reason} = error ->
-        block_issue(issue, reason)
+        block_issue(issue, reason, opts)
         error
     end
   end
 
-  def complete(_workspace, _issue, _worker_host), do: {:error, :invalid_handoff_arguments}
+  def complete(_workspace, _issue, _worker_host, _opts), do: {:error, :invalid_handoff_arguments}
 
   defp ensure_git_repo(workspace, worker_host) do
     case run(workspace, "git", ["rev-parse", "--is-inside-work-tree"], worker_host) do
@@ -148,15 +151,44 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp post_handoff(%Issue{} = issue, pr_url) when is_binary(pr_url) do
-    Tracker.post_handoff_comment(issue, handoff_comment(issue, pr_url))
+  defp post_handoff(%Issue{} = issue, pr_url, opts) when is_binary(pr_url) do
+    body = handoff_comment(issue, pr_url)
+    result = Tracker.post_handoff_comment(issue, body)
+
+    record_lifecycle_call(opts, "linear_post_handoff", %{issue_id: issue.id, body: body}, result)
+    result
   end
 
-  defp block_issue(issue, reason) do
+  defp move_to_human_review(%Issue{} = issue, opts) do
+    result = Tracker.move_issue_to_state(issue, "Human Review")
+
+    record_lifecycle_call(opts, "linear_move_to_human_review", %{issue_id: issue.id}, result)
+    result
+  end
+
+  defp block_issue(issue, reason, opts) do
     Logger.warning("Blocking issue after publish handoff failure issue_id=#{issue.id} issue_identifier=#{issue.identifier} reason=#{inspect(reason)}")
-    _ = Tracker.post_handoff_comment(issue, blocked_comment(reason))
-    _ = Tracker.move_issue_to_blocked(issue)
+    blocker_body = blocked_comment(reason)
+    blocker_result = Tracker.post_handoff_comment(issue, blocker_body)
+    blocked_result = Tracker.move_issue_to_blocked(issue)
+
+    record_lifecycle_call(opts, "linear_post_blocker", %{issue_id: issue.id, body: blocker_body}, blocker_result)
+    record_lifecycle_call(opts, "linear_move_to_blocked", %{issue_id: issue.id}, blocked_result)
     :ok
+  end
+
+  defp record_lifecycle_call(opts, tool_name, arguments, result) do
+    case Keyword.get(opts, :lifecycle_recorder) do
+      recorder when is_function(recorder, 1) ->
+        recorder.(%{
+          tool_name: tool_name,
+          tool_arguments: arguments,
+          tool_result: %{"success" => result == :ok}
+        })
+
+      _ ->
+        :ok
+    end
   end
 
   defp commit_message(%Issue{identifier: identifier, title: title}) do

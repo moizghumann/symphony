@@ -46,7 +46,8 @@ defmodule SymphonyElixir.PromptBuilder do
 
     - The issue id, state ids, project, team, title, description, and URL have already been resolved by Symphony.
     - Do not call generic Linear GraphQL for normal lifecycle actions.
-    - Use the provided narrow Linear helpers for posting handoff, posting blocker, moving to Human Review, and moving to Blocked.
+    - In the normal happy path, do not call handoff or Human Review helpers; finish repository work and emit `SYMPHONY_HANDOFF_READY` so Symphony can create the draft PR, post the handoff, and move the issue to Human Review.
+    - Narrow Linear helpers are available for supported fallback/runtime lifecycle operations such as posting blockers or moving to Blocked when Symphony cannot complete the handoff.
     - Use generic Linear GraphQL only if a narrow helper fails or if the required operation is not supported. If you use generic Linear GraphQL, explain why in the final run trace.
     - Codex owns repository work: edit, validate, commit, push, and summarize. Symphony owns final draft PR creation, the Linear handoff comment, and Human Review/Blocked state transitions.
     - When repository work is complete, committed, pushed, and validated, include the exact marker `SYMPHONY_HANDOFF_READY` in your final response so Symphony can create the draft PR.
