@@ -28,10 +28,29 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   @requirements ["app.start"]
 
   @repo "moizghumann/symphony"
+  @handoff_artifact_relpath ".phase36/handoff.json"
   @default_team_name "Agent Workbench"
   @default_project_name "Symphony Agent Queue"
   @default_lanes ["docs", "test", "research"]
   @supported_lanes ["docs", "bug", "feature", "refactor", "test", "chore", "research"]
+  @artifact_gate_fields [
+    "affected_files_inspected",
+    "behavior_change_documented",
+    "behavior_changed",
+    "behavior_preservation_evidence",
+    "dependency_update_evidence",
+    "explicitly_safe_validation_skip",
+    "failure_signal_identified",
+    "findings_posted",
+    "recommendation_included",
+    "scope_expanded",
+    "sources_inspected_listed",
+    "targeted_tests_run",
+    "test_coverage_added",
+    "tests_added",
+    "tests_not_added_reason",
+    "validation_required"
+  ]
   @expected_status_names [
     "Backlog",
     "Todo",
@@ -797,33 +816,41 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   defp evidence_for_lane(lane, issue, classification, runner_result, snapshot) do
     telemetry = telemetry_from_runner_result(runner_result)
+    artifact_result = handoff_artifact_result(lane, issue, classification, telemetry)
     comments = get_in(snapshot, ["comments", "nodes"]) || []
-    pr_url = find_pr_url(comments) || Map.get(telemetry, "pr_url")
-    changed_files = Map.get(telemetry, "changed_files")
-    validation = Map.get(telemetry, "validation") || %{}
-    final_state = get_in(snapshot, ["state", "name"]) || issue.state
+    pr_url = artifact_value(artifact_result, ["pr_url"]) || find_pr_url(comments) || Map.get(telemetry, "pr_url")
+    changed_files = artifact_value(artifact_result, ["changed_files"])
+    observed_changed_files = Map.get(telemetry, "changed_files") || []
+    validation = artifact_value(artifact_result, ["validation"]) || Map.get(telemetry, "validation") || %{}
+    artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
+    repo_changed = repo_changed?(artifact_repo_changed, observed_changed_files, pr_url)
+    final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
+    effective_changed_files = effective_changed_files(changed_files, observed_changed_files)
 
     gate_result =
-      finalization_gate_result(%{
+      %{
         lane: lane,
-        current_state: issue.state,
+        current_state: final_state,
         available_states: issue.available_states,
-        repo_changed: not blank?(pr_url) or non_empty_list?(changed_files),
-        changed_files: changed_files || [],
+        repo_changed: repo_changed,
+        changed_files: effective_changed_files,
         pr_url: pr_url,
-        branch_name: Map.get(telemetry, "branch_name"),
-        commit_sha: Map.get(telemetry, "commit_sha"),
+        branch_name: artifact_value(artifact_result, ["branch_name"]) || Map.get(telemetry, "branch_name"),
+        commit_sha: artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
         branch_pushed: not blank?(pr_url),
         pr_posted_to_linear: not blank?(pr_url),
-        handoff_posted: handoff_comment(comments) != nil,
-        validation_status: Map.get(validation, "status", :not_run),
+        handoff_posted: truthy?(artifact_value(artifact_result, ["handoff", "linear_comment_posted"])) or handoff_comment(comments) != nil,
+        validation_required: Map.get(validation, "required"),
+        validation_status: validation_status(validation),
         validation_reason: Map.get(validation, "reason"),
-        findings_posted: lane == "research" and handoff_comment(comments) != nil,
-        sources_inspected_listed: Map.get(telemetry, "sources_inspected_listed"),
-        recommendation_included: Map.get(telemetry, "recommendation_included"),
+        findings_posted: findings_posted?(lane, artifact_result, comments),
+        sources_inspected_listed: artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected_listed"),
+        recommendation_included: artifact_or_telemetry_value(artifact_result, telemetry, "recommendation_included"),
         budget_state: Map.get(telemetry, "budget_state", :ok),
         generic_linear_graphql_calls: Map.get(telemetry, "generic_linear_graphql_call_details", [])
-      })
+      }
+      |> Map.merge(artifact_gate_evidence(artifact_result, telemetry))
+      |> finalization_gate_result()
 
     evidence =
       %{
@@ -833,10 +860,14 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "classification_reason" => classification.reason,
         "final_state" => final_state,
         "pr_url" => pr_url,
-        "branch_name" => Map.get(telemetry, "branch_name"),
-        "changed_files" => changed_files,
-        "validation_status" => Map.get(validation, "status"),
+        "branch_name" => artifact_value(artifact_result, ["branch_name"]) || Map.get(telemetry, "branch_name"),
+        "commit_sha" => artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
+        "changed_files" => effective_changed_files,
+        "validation_status" => validation_status(validation),
         "validation_command_result" => Map.get(validation, "command_result"),
+        "validation_command" => Map.get(validation, "command"),
+        "validation_reason" => Map.get(validation, "reason"),
+        "repo_changed" => repo_changed,
         "effective_tokens" => Map.get(telemetry, "effective_tokens"),
         "gross_context_tokens" => Map.get(telemetry, "gross_context_tokens"),
         "cached_input_tokens" => Map.get(telemetry, "cached_input_tokens"),
@@ -849,11 +880,17 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "protocol_violations" => gate_result["violations"],
         "protocol_warnings" => gate_result["warnings"],
         "handoff_comment_id_or_url" => handoff_comment_id_or_url(comments),
+        "handoff_artifact_path" => Map.get(artifact_result, "path"),
+        "handoff_artifact_valid" => Map.get(artifact_result, "valid", false),
+        "handoff_artifact_status" => artifact_value(artifact_result, ["status"]),
+        "external_verification" => Map.get(artifact_result, "verification_placeholders") || external_verification_placeholders(),
         "missing_evidence" => [],
         "code_seams_needed" => []
       }
 
-    record_missing_evidence(evidence)
+    evidence
+    |> merge_artifact_findings(artifact_result)
+    |> record_missing_evidence()
   end
 
   defp telemetry_from_runner_result({:ok, telemetry}) when is_map(telemetry), do: telemetry
@@ -931,6 +968,236 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp seam_for_missing_field("validation_command_result"), do: "Expose structured validation command output from the Codex handoff."
   defp seam_for_missing_field("budget_state"), do: "Expose final budget state from direct AgentRunner live-smoke runs."
   defp seam_for_missing_field(_field), do: "Collect this field from Git/Linear handoff artifacts after the live run."
+
+  defp handoff_artifact_result(lane, issue, classification, telemetry) do
+    workspace_path = Map.get(telemetry, "workspace_path")
+    artifact_path = handoff_artifact_path(workspace_path)
+
+    result =
+      cond do
+        blank?(workspace_path) ->
+          %{"valid" => false, "violations" => [artifact_violation("missing_workspace_path", "Workspace path was not available for artifact validation.")]}
+
+        not File.exists?(artifact_path) ->
+          %{"valid" => false, "violations" => [artifact_violation("missing_handoff_artifact", "Expected #{@handoff_artifact_relpath} to exist before SYMPHONY_HANDOFF_READY.")]}
+
+        true ->
+          parse_handoff_artifact(artifact_path, lane, issue, classification, telemetry)
+      end
+
+    result
+    |> Map.put("path", artifact_path)
+  end
+
+  defp parse_handoff_artifact(artifact_path, lane, issue, classification, telemetry) do
+    case File.read(artifact_path) do
+      {:ok, body} ->
+        case Jason.decode(body) do
+          {:ok, %{} = artifact} ->
+            validate_handoff_artifact(artifact, lane, issue, classification, telemetry)
+
+          {:ok, _value} ->
+            %{"valid" => false, "violations" => [artifact_violation("invalid_handoff_artifact", "Handoff artifact must decode to a JSON object.")]}
+
+          {:error, _reason} ->
+            %{"valid" => false, "violations" => [artifact_violation("invalid_handoff_artifact_json", "Handoff artifact must contain valid JSON.")]}
+        end
+
+      {:error, reason} ->
+        %{"valid" => false, "violations" => [artifact_violation("handoff_artifact_read_failed", "Handoff artifact could not be read: #{inspect(reason)}")]}
+    end
+  end
+
+  defp validate_handoff_artifact(artifact, lane, issue, _classification, telemetry) do
+    observed_changed_files = Map.get(telemetry, "changed_files") || []
+    validation = Map.get(artifact, "validation") || %{}
+    handoff = Map.get(artifact, "handoff") || %{}
+    repo_changed = truthy?(Map.get(artifact, "repo_changed"))
+    protocol_notes = List.wrap(Map.get(artifact, "protocol_notes")) |> Enum.reject(&blank?/1)
+
+    violations =
+      []
+      |> require_artifact_field(artifact, "lane")
+      |> require_artifact_field(artifact, "linear_issue_identifier")
+      |> require_artifact_field(artifact, "status")
+      |> require_artifact_field(artifact, "repo_changed")
+      |> require_artifact_field(artifact, "branch_name")
+      |> require_artifact_field(artifact, "commit_sha")
+      |> require_artifact_field(artifact, "pr_url")
+      |> require_artifact_field(artifact, "changed_files")
+      |> require_artifact_field(validation, "required", "validation.required")
+      |> require_artifact_field(validation, "status", "validation.status")
+      |> require_artifact_field(validation, "command", "validation.command")
+      |> require_artifact_field(validation, "reason", "validation.reason")
+      |> require_artifact_field(handoff, "linear_comment_posted", "handoff.linear_comment_posted")
+      |> require_artifact_field(handoff, "final_state_requested", "handoff.final_state_requested")
+      |> require_artifact_field(artifact, "protocol_notes")
+      |> lane_mismatch_violations(artifact, lane, issue)
+      |> repo_change_violations(lane, artifact, observed_changed_files)
+      |> docs_validation_violations(lane, validation)
+      |> research_artifact_violations(lane, repo_changed, handoff, protocol_notes)
+      |> lane_validation_violations(lane, validation)
+
+    %{
+      "artifact" => artifact,
+      "valid" => violations == [],
+      "violations" => violations,
+      "warnings" => [],
+      "verification_placeholders" => verify_external_handoff_artifacts(artifact, telemetry)
+    }
+  end
+
+  defp require_artifact_field(violations, map, key, label \\ nil) do
+    field_label = label || key
+
+    if Map.has_key?(map, key) do
+      violations
+    else
+      [artifact_violation("missing_#{String.replace(field_label, ".", "_")}", "Handoff artifact is missing required field #{field_label}.") | violations]
+    end
+  end
+
+  defp lane_mismatch_violations(violations, artifact, lane, issue) do
+    artifact_lane = Map.get(artifact, "lane")
+    artifact_issue = Map.get(artifact, "linear_issue_identifier")
+
+    violations
+    |> maybe_add_violation(artifact_lane != lane, "handoff_artifact_lane_mismatch", "Handoff artifact lane #{inspect(artifact_lane)} did not match requested lane #{inspect(lane)}.")
+    |> maybe_add_violation(
+      artifact_issue != issue.identifier,
+      "handoff_artifact_issue_mismatch",
+      "Handoff artifact issue #{inspect(artifact_issue)} did not match Linear issue #{inspect(issue.identifier)}."
+    )
+  end
+
+  defp repo_change_violations(violations, lane, artifact, observed_changed_files) do
+    repo_changed = truthy?(Map.get(artifact, "repo_changed"))
+    branch_name = Map.get(artifact, "branch_name")
+    commit_sha = Map.get(artifact, "commit_sha")
+    pr_url = Map.get(artifact, "pr_url")
+
+    violations
+    |> maybe_add_violation(
+      repo_changed and repo_changing_lane?(lane) and (blank?(branch_name) or blank?(commit_sha) or blank?(pr_url)),
+      "repo_change_artifact_missing_git_fields",
+      "Repo-changing lane artifacts must include branch_name, commit_sha, and pr_url when repo_changed=true."
+    )
+    |> maybe_add_violation(
+      not repo_changed and non_empty_list?(observed_changed_files),
+      "repo_change_artifact_mismatch",
+      "Artifact reported repo_changed=false while the workspace showed repository changes."
+    )
+  end
+
+  defp docs_validation_violations(violations, lane, validation) do
+    status = validation_status(validation)
+    reason = Map.get(validation, "reason")
+
+    maybe_add_violation(
+      violations,
+      lane == "docs" and status == "not_run" and blank?(reason),
+      "docs_validation_reason_required",
+      "Docs artifacts that skip validation must provide validation.reason."
+    )
+  end
+
+  defp research_artifact_violations(violations, lane, repo_changed, handoff, protocol_notes) do
+    maybe_add_violation(
+      violations,
+      lane == "research" and not repo_changed and (not truthy?(Map.get(handoff, "linear_comment_posted")) or protocol_notes == []),
+      "research_findings_evidence_required",
+      "Read-only research artifacts must include findings evidence in protocol_notes and confirm the Linear comment was posted."
+    )
+  end
+
+  defp lane_validation_violations(violations, lane, validation) do
+    status = validation_status(validation)
+
+    maybe_add_violation(
+      violations,
+      lane in ["feature", "refactor", "bug", "test", "chore"] and status in [nil, "", "not_run"],
+      "lane_validation_required",
+      "Feature, refactor, bug, test, and chore artifacts must include executed validation evidence."
+    )
+  end
+
+  defp merge_artifact_findings(evidence, artifact_result) do
+    artifact_violations = Map.get(artifact_result, "violations", [])
+    artifact_warnings = Map.get(artifact_result, "warnings", [])
+
+    evidence
+    |> Map.update!("protocol_violations", &(artifact_violations ++ &1))
+    |> Map.update!("protocol_warnings", &(artifact_warnings ++ artifact_verification_warnings() ++ &1))
+    |> Map.put("finalization_gate_result", if(artifact_violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
+  end
+
+  defp artifact_verification_warnings do
+    [
+      artifact_warning("github_artifact_verification_pending", "GitHub artifact verification hook is pending implementation."),
+      artifact_warning("linear_artifact_verification_pending", "Linear artifact verification hook is pending implementation.")
+    ]
+  end
+
+  defp external_verification_placeholders do
+    %{
+      "github" => %{"status" => "pending_hook"},
+      "linear" => %{"status" => "pending_hook"}
+    }
+  end
+
+  defp verify_external_handoff_artifacts(_artifact, _telemetry), do: external_verification_placeholders()
+
+  defp artifact_value(%{"artifact" => artifact}, path) when is_map(artifact), do: get_in(artifact, path)
+  defp artifact_value(_artifact_result, _path), do: nil
+
+  defp artifact_or_telemetry_value(artifact_result, telemetry, field) do
+    case artifact_value(artifact_result, [field]) do
+      nil -> Map.get(telemetry, field)
+      value -> value
+    end
+  end
+
+  defp artifact_gate_evidence(artifact_result, telemetry) do
+    Map.new(@artifact_gate_fields, fn field ->
+      {String.to_atom(field), artifact_or_telemetry_value(artifact_result, telemetry, field)}
+    end)
+    |> Enum.reject(fn {_field, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp effective_changed_files(changed_files, observed_changed_files) do
+    cond do
+      non_empty_list?(observed_changed_files) -> observed_changed_files
+      is_list(changed_files) -> changed_files
+      true -> []
+    end
+  end
+
+  defp handoff_artifact_path(workspace_path) when is_binary(workspace_path), do: Path.join(workspace_path, @handoff_artifact_relpath)
+  defp handoff_artifact_path(_workspace_path), do: @handoff_artifact_relpath
+
+  defp repo_changed?(artifact_repo_changed, observed_changed_files, pr_url) do
+    truthy?(artifact_repo_changed) or non_empty_list?(observed_changed_files) or not blank?(pr_url)
+  end
+
+  defp findings_posted?(lane, artifact_result, comments) do
+    lane == "research" and (truthy?(artifact_value(artifact_result, ["handoff", "linear_comment_posted"])) or handoff_comment(comments) != nil)
+  end
+
+  defp validation_status(%{} = validation) do
+    value = Map.get(validation, "status")
+    if is_atom(value), do: Atom.to_string(value), else: value
+  end
+
+  defp validation_status(_validation), do: nil
+
+  defp repo_changing_lane?(lane), do: lane in ["docs", "bug", "feature", "refactor", "test", "chore"]
+
+  defp artifact_violation(code, message), do: %{"code" => code, "message" => message, "severity" => "error"}
+  defp artifact_warning(code, message), do: %{"code" => code, "message" => message, "severity" => "warning"}
+
+  defp maybe_add_violation(violations, true, code, message), do: [artifact_violation(code, message) | violations]
+  defp maybe_add_violation(violations, false, _code, _message), do: violations
 
   defp fetch_issue!(issue_id, deps) do
     deps
@@ -1113,6 +1380,24 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     The current working directory is already the managed repository clone.
     Make the requested file edit only. Leave branch creation, commit, push, and draft PR publication to the parent handoff.
     Do not create a second clone or work from `/tmp` for repository changes.
+    Before emitting `SYMPHONY_HANDOFF_READY`, write `.phase36/handoff.json` in the managed workspace.
+    The handoff artifact must be valid JSON and include:
+    - `lane`
+    - `linear_issue_identifier`
+    - `status`
+    - `repo_changed`
+    - `branch_name`
+    - `commit_sha`
+    - `pr_url`
+    - `changed_files`
+    - `validation.required`
+    - `validation.status`
+    - `validation.command`
+    - `validation.reason`
+    - `handoff.linear_comment_posted`
+    - `handoff.final_state_requested`
+    - `protocol_notes`
+    Do not emit `SYMPHONY_HANDOFF_READY` until the file exists and reflects the final handoff state.
     """
   end
 
@@ -1231,12 +1516,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
     if is_binary(workspace_path) and File.dir?(Path.join(workspace_path, ".git")) do
       %{
+        "workspace_path" => workspace_path,
         "branch_name" => git(workspace_path, ["branch", "--show-current"]),
         "commit_sha" => git(workspace_path, ["rev-parse", "HEAD"]),
         "changed_files" => git_lines(workspace_path, ["diff", "--name-only", "origin/main...HEAD"])
       }
     else
-      %{}
+      case workspace_path do
+        path when is_binary(path) -> %{"workspace_path" => path}
+        _ -> %{}
+      end
     end
   end
 
@@ -1375,6 +1664,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp missing?(_value), do: false
 
   defp non_empty_list?(value), do: is_list(value) and value != []
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?(1), do: true
+  defp truthy?(_value), do: false
 
   defp blank?(value) when is_binary(value), do: String.trim(value) == ""
   defp blank?(nil), do: true

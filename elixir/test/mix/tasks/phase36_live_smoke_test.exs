@@ -37,13 +37,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
               assert issue.state == "In Progress"
               assert issue.state_id == preflight.state_ids["In Progress"]
 
-              {:ok,
-               %{
-                 "tool_call_count" => 1,
-                 "generic_linear_graphql_calls" => 0,
-                 "narrow_linear_lifecycle_calls" => 1,
-                 "budget_state" => "ok"
-               }}
+              {:ok, artifact_runner_result(issue)}
             end,
             write_file: &File.write!/2
           })
@@ -183,19 +177,13 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           linear_graphql: fn query, variables ->
             project_resolution_graphql(query, variables, case_data)
           end,
-          run_agent: fn _issue, preflight, _output_path ->
+          run_agent: fn issue, preflight, _output_path ->
             assert preflight.project["id"] == case_data.project["id"]
             assert preflight.project["name"] == case_data.project["name"]
             assert preflight.project["slugId"] == case_data.project["slugId"]
             assert preflight.project["url"] == case_data.project["url"]
 
-            {:ok,
-             %{
-               "tool_call_count" => 1,
-               "generic_linear_graphql_calls" => 0,
-               "narrow_linear_lifecycle_calls" => 1,
-               "budget_state" => "ok"
-             }}
+            {:ok, artifact_runner_result(issue)}
           end,
           write_file: &File.write!/2
         })
@@ -232,13 +220,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           assert issue.state == "In Progress"
           assert issue.state_id == preflight.state_ids["In Progress"]
 
-          {:ok,
-           %{
-             "tool_call_count" => 1,
-             "generic_linear_graphql_calls" => 0,
-             "narrow_linear_lifecycle_calls" => 1,
-             "budget_state" => "ok"
-           }}
+          {:ok, artifact_runner_result(issue)}
         end,
         write_file: &File.write!/2
       })
@@ -249,13 +231,256 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     evidence = output_path |> File.read!() |> Jason.decode!()
     assert evidence["preflight"]["state_ids"]["Todo"] == "state-todo"
     assert evidence["preflight"]["state_ids"]["In Progress"] == "state-in-progress"
-    assert evidence["results"] |> Enum.map(& &1["final_state"]) |> Enum.all?(&(&1 == "In Progress"))
+
+    assert evidence["results"]
+           |> Enum.map(& &1["handoff_artifact_valid"])
+           |> Enum.all?(&(&1 == true))
+
+    File.rm(output_path)
+  end
+
+  test "accepts a valid docs handoff artifact" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, {:artifact, %{"lane" => "docs"}})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == true
+    assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["repo_changed"] == true
+    refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+
+    File.rm(output_path)
+  end
+
+  test "fails a lane when the handoff artifact is missing" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          workspace_path = temp_workspace_path()
+          File.mkdir_p!(workspace_path)
+
+          {:ok,
+           %{
+             "workspace_path" => workspace_path,
+             "tool_call_count" => 1,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 1,
+             "budget_state" => "ok",
+             "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+
+    File.rm(output_path)
+  end
+
+  test "fails a lane when the handoff artifact contains invalid json" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, {:raw, "{not-json"})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "invalid_handoff_artifact_json"))
+
+    File.rm(output_path)
+  end
+
+  test "accepts a research read-only artifact" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "research",
+                "repo_changed" => false,
+                "branch_name" => nil,
+                "commit_sha" => nil,
+                "pr_url" => nil,
+                "changed_files" => [],
+                "validation" => %{
+                  "required" => false,
+                  "status" => "not_run",
+                  "command" => "not required",
+                  "reason" => "read-only research lane"
+                },
+                "handoff" => %{
+                  "linear_comment_posted" => true,
+                  "final_state_requested" => "Human Review"
+                },
+                "protocol_notes" => ["Findings posted to Linear handoff comment."]
+              }},
+             %{"changed_files" => []}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == true
+    assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["repo_changed"] == false
+    refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_evidence_required"))
+
+    File.rm(output_path)
+  end
+
+  test "fails repo-changing artifact without pr evidence" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact, %{"lane" => "docs", "pr_url" => nil}},
+             %{"changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "repo_change_artifact_missing_git_fields"))
+
+    File.rm(output_path)
+  end
+
+  test "fails docs validation skip without reason" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "docs",
+                "validation" => %{
+                  "required" => false,
+                  "status" => "not_run",
+                  "command" => "not required",
+                  "reason" => nil
+                }
+              }}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "docs_validation_reason_required"))
+
+    File.rm(output_path)
+  end
+
+  test "fails repo_changed false while git reports changes" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "docs",
+                "repo_changed" => false,
+                "branch_name" => nil,
+                "commit_sha" => nil,
+                "pr_url" => nil,
+                "changed_files" => []
+              }},
+             %{"changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "repo_change_artifact_mismatch"))
 
     File.rm(output_path)
   end
 
   test "writes evidence with missing fields instead of faking success" do
-    output_path = Path.join(System.tmp_dir!(), "phase36-live-smoke-test-#{System.unique_integer([:positive])}.json")
+    output_path = temp_output_path()
     agent_runs = Agent.start_link(fn -> [] end) |> elem(1)
 
     deps =
@@ -265,13 +490,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
         run_agent: fn issue, _preflight, _output_path ->
           Agent.update(agent_runs, &[issue.identifier | &1])
 
-          {:ok,
-           %{
-             "tool_call_count" => 1,
-             "generic_linear_graphql_calls" => 0,
-             "narrow_linear_lifecycle_calls" => 1,
-             "budget_state" => "ok"
-           }}
+          {:ok, artifact_runner_result(issue)}
         end,
         write_file: &File.write!/2
       })
@@ -326,7 +545,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
   end
 
   defp temp_output_path do
-    Path.join(System.tmp_dir!(), "phase36-live-smoke-test-#{System.unique_integer([:positive])}.json")
+    Path.join(System.tmp_dir!(), "phase36-live-smoke-test-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}.json")
   end
 
   defp selector_env(selector) do
@@ -352,6 +571,168 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     end
   end
 
+  defp artifact_runner_result(issue, artifact_mode \\ :valid, telemetry_overrides \\ %{}) do
+    workspace_path = temp_workspace_path()
+    File.mkdir_p!(workspace_path)
+    File.mkdir_p!(Path.join(workspace_path, ".phase36"))
+
+    case artifact_mode do
+      :missing ->
+        :ok
+
+      {:raw, body} when is_binary(body) ->
+        File.write!(Path.join(workspace_path, ".phase36/handoff.json"), body)
+
+      {:artifact, overrides} when is_map(overrides) ->
+        issue
+        |> default_handoff_artifact()
+        |> deep_merge(overrides)
+        |> write_handoff_artifact!(workspace_path)
+
+      :valid ->
+        issue
+        |> default_handoff_artifact()
+        |> write_handoff_artifact!(workspace_path)
+    end
+
+    Map.merge(
+      %{
+        "workspace_path" => workspace_path,
+        "tool_call_count" => 1,
+        "generic_linear_graphql_calls" => 0,
+        "narrow_linear_lifecycle_calls" => 1,
+        "budget_state" => "ok",
+        "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]
+      },
+      telemetry_overrides
+    )
+  end
+
+  defp temp_workspace_path do
+    Path.join(System.tmp_dir!(), "phase36-live-smoke-workspace-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}")
+  end
+
+  defp default_handoff_artifact(issue) do
+    lane = issue_lane(issue)
+
+    base =
+      %{
+        "lane" => lane,
+        "linear_issue_identifier" => issue.identifier,
+        "status" => "handoff_ready",
+        "repo_changed" => lane != "research",
+        "branch_name" => issue.branch_name || "agent/#{lane}-artifact",
+        "commit_sha" => "0123456789abcdef0123456789abcdef01234567",
+        "pr_url" => "https://github.com/moizghumann/symphony/pull/7",
+        "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"],
+        "validation" => %{
+          "required" => lane not in ["docs", "research"],
+          "status" => if(lane == "docs" or lane == "research", do: "not_run", else: "passed"),
+          "command" => default_validation_command(lane),
+          "reason" => default_validation_reason(lane)
+        },
+        "handoff" => %{
+          "linear_comment_posted" => true,
+          "final_state_requested" => default_final_state(lane)
+        },
+        "protocol_notes" => default_protocol_notes(lane)
+      }
+      |> Map.merge(default_lane_evidence(lane))
+
+    case lane do
+      "research" ->
+        base
+        |> Map.put("repo_changed", false)
+        |> Map.put("branch_name", nil)
+        |> Map.put("commit_sha", nil)
+        |> Map.put("pr_url", nil)
+        |> Map.put("changed_files", [])
+
+      _ ->
+        base
+    end
+  end
+
+  defp write_handoff_artifact!(artifact, workspace_path) do
+    File.write!(Path.join(workspace_path, ".phase36/handoff.json"), Jason.encode!(artifact, pretty: true))
+  end
+
+  defp default_validation_command("docs"), do: "not required"
+  defp default_validation_command("research"), do: "not required"
+  defp default_validation_command(_lane), do: "cd elixir && mise exec -- mix test test/mix/tasks/phase36_live_smoke_test.exs"
+
+  defp default_validation_reason("docs"), do: "docs-only change"
+  defp default_validation_reason("research"), do: "read-only research lane"
+  defp default_validation_reason(_lane), do: nil
+
+  defp default_final_state("research"), do: "Human Review"
+  defp default_final_state(_lane), do: "Human Review"
+
+  defp default_protocol_notes("research"), do: ["Findings posted to Linear handoff comment."]
+  defp default_protocol_notes("refactor"), do: ["Behavior-preservation evidence recorded."]
+  defp default_protocol_notes("bug"), do: ["Failure signal captured before the fix."]
+  defp default_protocol_notes("feature"), do: ["User-visible feature evidence recorded."]
+  defp default_protocol_notes("test"), do: ["Focused regression test coverage recorded."]
+  defp default_protocol_notes("chore"), do: ["Maintenance-only scope and validation recorded."]
+  defp default_protocol_notes(_lane), do: ["Phase 3.6 handoff artifact recorded."]
+
+  defp default_lane_evidence("research") do
+    %{
+      "findings_posted" => true,
+      "sources_inspected_listed" => true,
+      "recommendation_included" => true
+    }
+  end
+
+  defp default_lane_evidence("feature"), do: %{"tests_added" => true, "scope_expanded" => false}
+
+  defp default_lane_evidence("bug") do
+    %{
+      "failure_signal_identified" => true,
+      "affected_files_inspected" => true
+    }
+  end
+
+  defp default_lane_evidence("refactor") do
+    %{
+      "behavior_preservation_evidence" => true,
+      "behavior_changed" => false,
+      "scope_expanded" => false
+    }
+  end
+
+  defp default_lane_evidence("test"), do: %{"targeted_tests_run" => true, "test_coverage_added" => true}
+  defp default_lane_evidence(_lane), do: %{}
+
+  defp issue_lane(issue) do
+    case Regex.run(~r/Lane:\s*([a-z]+)/, issue.description || "") do
+      [_, lane] ->
+        lane
+
+      _ ->
+        title_lane(issue.title) || issue.lane_classification.lane |> Atom.to_string()
+    end
+  end
+
+  defp title_lane("Docs live smoke" <> _rest), do: "docs"
+  defp title_lane("Add regression tests" <> _rest), do: "test"
+  defp title_lane("Fix Phase 3.6 live smoke" <> _rest), do: "bug"
+  defp title_lane("Feature live smoke" <> _rest), do: "feature"
+  defp title_lane("Refactor live smoke" <> _rest), do: "refactor"
+  defp title_lane("Chore live smoke" <> _rest), do: "chore"
+  defp title_lane("Research live smoke" <> _rest), do: "research"
+  defp title_lane(_title), do: nil
+
+  defp deep_merge(left, right) when is_map(left) and is_map(right) do
+    Map.merge(left, right, fn _key, left_value, right_value ->
+      if is_map(left_value) and is_map(right_value) do
+        deep_merge(left_value, right_value)
+      else
+        right_value
+      end
+    end)
+  end
+
   defp fake_linear_graphql(query, variables) do
     cond do
       String.contains?(query, "Phase36LiveSmokeViewer") ->
@@ -374,6 +755,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
       String.contains?(query, "Phase36LiveSmokeCreateIssue") ->
         issue = issue_payload(variables.title, variables.description)
+        remember_issue(issue)
         {:ok, %{"data" => %{"issueCreate" => %{"success" => true, "issue" => issue}}}}
 
       String.contains?(query, "Phase36LiveSmokeIssue") ->
@@ -424,6 +806,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
       String.contains?(query, "Phase36LiveSmokeCreateIssue") ->
         issue = issue_payload(variables.title, variables.description)
+        remember_issue(issue)
         {:ok, %{"data" => %{"issueCreate" => %{"success" => true, "issue" => issue}}}}
 
       String.contains?(query, "Phase36LiveSmokeIssue") ->
@@ -448,6 +831,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
       String.contains?(query, "Phase36LiveSmokeCreateIssue") ->
         issue = issue_payload(variables.title, variables.description)
         Agent.update(issue_state, fn _ -> %{"state" => %{"id" => "state-todo", "name" => "Todo"}} end)
+        remember_issue(issue)
         {:ok, %{"data" => %{"issueCreate" => %{"success" => true, "issue" => issue}}}}
 
       String.contains?(query, "Phase36LiveSmokeIssue") ->
@@ -455,7 +839,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
          %{
            "data" => %{
              "issue" =>
-               issue_payload("Snapshot #{variables.id}", "Snapshot")
+               current_issue_payload()
                |> Map.put("id", variables.id)
                |> Map.put("identifier", "AWB-123")
                |> Map.put("state", Agent.get(issue_state, & &1["state"]))
@@ -491,9 +875,21 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
   end
 
   defp issue_snapshot(issue_id, state) do
-    issue_payload("Snapshot #{issue_id}", "Snapshot")
+    current_issue_payload()
     |> Map.put("state", state)
+    |> Map.put("id", issue_id)
     |> Map.put("comments", %{"nodes" => []})
+  end
+
+  defp remember_issue(issue) do
+    Process.put({__MODULE__, :phase36_issue_payload}, issue)
+  end
+
+  defp current_issue_payload do
+    Process.get(
+      {__MODULE__, :phase36_issue_payload},
+      issue_payload("Snapshot issue", "Snapshot")
+    )
   end
 
   defp current_issue_state do
