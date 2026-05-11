@@ -96,6 +96,8 @@ Validated:
 
 real smoke tests attempted but not run to mutation
 
+Docs lane live smoke AGE-16 is exercising the repository-changing docs path with validation recorded as not run because the change is documentation-only.
+
 Latest preflight attempt, 2026-05-11:
 
 - `RUN_REAL_SMOKE=true`
