@@ -1165,6 +1165,40 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "runtime sandbox policy adds active workspace git root when parent workspace is writable" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-git-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "AGE-14")
+      git_root = Path.join(issue_workspace, ".git")
+      File.mkdir_p!(git_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: [workspace_root],
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+
+      assert runtime_settings.turn_sandbox_policy == %{
+               "type" => "workspaceWrite",
+               "writableRoots" => [workspace_root, git_root],
+               "networkAccess" => true
+             }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "path safety returns errors for invalid path segments" do
     invalid_segment = String.duplicate("a", 300)
     path = Path.join(System.tmp_dir!(), invalid_segment)

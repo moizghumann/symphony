@@ -367,12 +367,13 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        {:ok, maybe_add_workspace_git_root(policy, workspace, opts)}
 
       _ ->
         workspace
         |> default_workspace_root(settings.workspace.root)
         |> default_runtime_turn_sandbox_policy(opts)
+        |> maybe_add_workspace_git_root(workspace, opts)
     end
   end
 
@@ -564,6 +565,55 @@ defmodule SymphonyElixir.Config.Schema do
   defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
   end
+
+  defp maybe_add_workspace_git_root({:ok, policy}, workspace, opts) do
+    {:ok, maybe_add_workspace_git_root(policy, workspace, opts)}
+  end
+
+  defp maybe_add_workspace_git_root({:error, _reason} = error, _workspace, _opts), do: error
+
+  defp maybe_add_workspace_git_root(%{} = policy, workspace, opts) when is_binary(workspace) do
+    cond do
+      Keyword.get(opts, :remote, false) ->
+        policy
+
+      sandbox_type(policy) != "workspaceWrite" ->
+        policy
+
+      true ->
+        add_git_root_when_workspace_covered(policy, workspace)
+    end
+  end
+
+  defp maybe_add_workspace_git_root(policy, _workspace, _opts), do: policy
+
+  defp add_git_root_when_workspace_covered(policy, workspace) do
+    writable_roots = Map.get(policy, "writableRoots") || Map.get(policy, :writableRoots)
+    expanded_workspace = Path.expand(workspace)
+    git_root = Path.join(expanded_workspace, ".git")
+
+    if is_list(writable_roots) and File.dir?(git_root) and Enum.any?(writable_roots, &covers_workspace?(&1, expanded_workspace)) do
+      roots =
+        writable_roots
+        |> Enum.map(&to_string/1)
+        |> then(fn roots -> if git_root in roots, do: roots, else: roots ++ [git_root] end)
+
+      policy
+      |> Map.delete(:writableRoots)
+      |> Map.put("writableRoots", roots)
+    else
+      policy
+    end
+  end
+
+  defp sandbox_type(policy), do: Map.get(policy, "type") || Map.get(policy, :type)
+
+  defp covers_workspace?(root, expanded_workspace) when is_binary(root) do
+    expanded_root = Path.expand(root)
+    expanded_workspace == expanded_root or String.starts_with?(expanded_workspace, expanded_root <> "/")
+  end
+
+  defp covers_workspace?(_root, _expanded_workspace), do: false
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
     do: workspace
