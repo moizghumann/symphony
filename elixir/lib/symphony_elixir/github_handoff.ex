@@ -29,12 +29,12 @@ defmodule SymphonyElixir.GitHubHandoff do
          {:ok, branch} <- ensure_branch(workspace, issue, worker_host, opts),
          :ok <- ensure_committed(workspace, worker_host, issue, opts),
          {:ok, commit_sha} <- head_sha(workspace, worker_host),
-         :ok <- ensure_pushed(workspace, branch, worker_host, opts),
-         {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
+         {:ok, final_branch} <- ensure_pushed(workspace, branch, issue, worker_host, opts),
+         {:ok, pr_url} <- create_draft_pr(workspace, final_branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url, opts),
          :ok <-
            update_phase36_handoff_artifact(workspace, %{
-             branch_name: branch,
+             branch_name: final_branch,
              commit_sha: commit_sha,
              pr_url: pr_url,
              changed_files: artifacts.changed_files,
@@ -42,12 +42,12 @@ defmodule SymphonyElixir.GitHubHandoff do
              final_state_requested: contract.review_state
            }),
          :ok <- ensure_committed(workspace, worker_host, issue, opts),
-         :ok <- ensure_pushed(workspace, branch, worker_host, opts),
+         {:ok, final_branch} <- ensure_pushed(workspace, final_branch, issue, worker_host, opts),
          :ok <-
            move_to_human_review(
              issue,
              Map.merge(artifacts, %{
-               branch_name: branch,
+               branch_name: final_branch,
                commit_sha: commit_sha,
                branch_pushed: true,
                pr_url: pr_url,
@@ -253,29 +253,92 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp ensure_pushed(workspace, branch, worker_host, opts) when is_binary(branch) do
+  defp ensure_pushed(workspace, branch, %Issue{} = issue, worker_host, opts) when is_binary(branch) do
     with {:ok, head_sha} <- run(workspace, "git", ["rev-parse", "HEAD"], worker_host),
          {:ok, remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", branch], worker_host) do
       local_sha = String.trim(head_sha)
 
-      if remote_contains_sha?(remote_output, local_sha) do
-        :ok
-      else
-        if Keyword.get(opts, :auto_publish_from_main, false) do
-          case run(workspace, "git", ["push", "-u", "origin", branch], worker_host) do
-            {:ok, _output} -> :ok
-            {:error, reason} -> {:error, {:git_push_failed, reason}}
-          end
-        else
-          {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
-        end
-      end
+      push_or_reuse_branch(workspace, branch, issue, local_sha, remote_output, worker_host, opts)
     else
       {:error, reason} -> {:error, {:git_push_failed, reason}}
     end
   end
 
+  defp push_or_reuse_branch(workspace, branch, issue, local_sha, remote_output, worker_host, opts) do
+    case remote_branch_sha(remote_output) do
+      ^local_sha ->
+        {:ok, branch}
+
+      nil ->
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          push_branch(workspace, branch, branch, worker_host)
+        else
+          {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
+        end
+
+      remote_sha ->
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          retry_branch = retry_branch_name(branch, issue, local_sha)
+
+          with {:ok, retry_remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", retry_branch], worker_host) do
+            case remote_branch_sha(retry_remote_output) do
+              ^local_sha -> {:ok, retry_branch}
+              nil -> push_branch(workspace, branch, retry_branch, worker_host)
+              retry_remote_sha -> {:error, {:git_push_failed, {:remote_branch_conflict, retry_branch, local_sha, retry_remote_sha}}}
+            end
+          else
+            {:error, reason} -> {:error, {:git_push_failed, reason}}
+          end
+        else
+          {:error, {:git_push_failed, {:remote_branch_conflict, branch, local_sha, remote_sha}}}
+        end
+    end
+  end
+
+  defp push_branch(workspace, local_branch, remote_branch, worker_host) when local_branch == remote_branch do
+    case run(workspace, "git", ["push", "-u", "origin", local_branch], worker_host) do
+      {:ok, _output} -> {:ok, remote_branch}
+      {:error, reason} -> {:error, {:git_push_failed, reason}}
+    end
+  end
+
+  defp push_branch(workspace, _local_branch, remote_branch, worker_host) do
+    case run(workspace, "git", ["push", "-u", "origin", "HEAD:refs/heads/#{remote_branch}"], worker_host) do
+      {:ok, _output} -> {:ok, remote_branch}
+      {:error, reason} -> {:error, {:git_push_failed, reason}}
+    end
+  end
+
   defp create_draft_pr(workspace, branch, %Issue{} = issue, worker_host) do
+    case existing_draft_pr_url(workspace, branch, worker_host) do
+      {:ok, pr_url} -> {:ok, pr_url}
+      :not_found -> create_new_draft_pr(workspace, branch, issue, worker_host)
+    end
+  end
+
+  defp existing_draft_pr_url(workspace, branch, worker_host) do
+    args = ["pr", "view", "--head", branch, "--json", "url,isDraft", "--jq", "select(.isDraft == true) | .url"]
+
+    case run(workspace, "gh", args, worker_host) do
+      {:ok, output} ->
+        case extract_url(output) do
+          nil -> :not_found
+          url -> {:ok, url}
+        end
+
+      {:error, {_status, output}} when is_binary(output) ->
+        if String.contains?(String.downcase(output), ["no pull requests found", "not found"]) do
+          :not_found
+        else
+          :not_found
+        end
+
+      {:error, _reason} ->
+        :not_found
+    end
+  end
+
+  defp create_new_draft_pr(workspace, branch, %Issue{} = issue, worker_host) do
     args = [
       "pr",
       "create",
@@ -560,15 +623,35 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp git_not_a_repo_error?(_reason), do: false
 
-  defp remote_contains_sha?(remote_output, local_sha) when is_binary(remote_output) and is_binary(local_sha) do
+  defp remote_branch_sha(remote_output) when is_binary(remote_output) do
     remote_output
     |> String.split("\n", trim: true)
-    |> Enum.any?(fn line ->
-      line
-      |> String.split()
-      |> List.first()
-      |> Kernel.==(local_sha)
-    end)
+    |> List.first()
+    |> case do
+      nil ->
+        nil
+
+      line ->
+        line
+        |> String.split()
+        |> List.first()
+    end
+  end
+
+  defp retry_branch_name(branch, %Issue{} = issue, local_sha) do
+    identifier =
+      issue.identifier
+      |> to_string()
+      |> slug()
+
+    suffix = local_sha |> to_string() |> String.slice(0, 8)
+    base = branch |> String.trim() |> String.trim_trailing("-#{suffix}")
+
+    if String.contains?(base, identifier) do
+      "#{base}-#{suffix}"
+    else
+      "#{base}-#{identifier}-#{suffix}"
+    end
   end
 
   defp slug(value) when is_binary(value) do
