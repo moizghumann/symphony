@@ -4,19 +4,19 @@
 
 partial
 
-Layer A unit tests and Layer B local dry-run simulations pass. Layer C real Linear/GitHub smoke tests were not run because the live preflight is currently blocked by invalid GitHub CLI authentication.
+Layer A unit tests and Layer B local dry-run simulations pass. The required 2026-05-11 non-mutating GitHub/Linear preflight now passes, and local validation was rerun successfully. Layer C real Linear/GitHub smoke tests are still not run because this repo does not yet contain an existing safe Phase 3.6 live-smoke command or test harness that runs only the first three lanes and collects the required evidence without improvising unsafe mutations.
 
 ## Test Matrix
 
 | Lane | Unit tests | Dry run | Real smoke | Result |
 |---|---|---|---|---|
-| docs | pass | pass | not run | partial |
-| bug | pass | pass | not run | partial |
+| docs | pass | pass | not run, no safe runner | partial |
+| bug | pass | pass | not run, no safe runner | partial |
 | feature | pass | pass | not run | partial |
 | refactor | pass | pass | not run | partial |
-| test | pass | pass | not run | partial |
+| test | pass | pass | not run, no safe runner | partial |
 | chore | pass | pass | not run | partial |
-| research | pass | pass | not run | partial |
+| research | pass | pass | not run, no safe runner | partial |
 
 ## Key Findings
 
@@ -94,70 +94,62 @@ Validated:
 
 ## Real Smoke Status
 
-real smoke tests attempted but not run to mutation
+real smoke not run to mutation
 
-Latest preflight attempt, 2026-05-11:
+Latest preflight and local validation attempt, 2026-05-11:
 
 - `RUN_REAL_SMOKE=true`
 - `LINEAR_API_KEY` present
 - `GH_TOKEN` present
 - `GITHUB_TOKEN` present
+- `gh auth status` passed for GitHub account `moizghumann` using `GH_TOKEN`
 - `gh repo view moizghumann/symphony --json nameWithOwner` passed with `{"nameWithOwner":"moizghumann/symphony"}`
 - Linear viewer query passed for `Moiz Ghuman <moizghuman@gmail.com>`
 - Linear team/status query passed for team `Agent Workbench` and returned the expected statuses: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Rework`, `Merging`, `Blocked`, `Done`, `Duplicate`, `Canceled`
-- `gh auth status` failed because `GH_TOKEN` is invalid:
-  - `Failed to log in to github.com using token (GH_TOKEN)`
-  - `The token in GH_TOKEN is invalid.`
-  - default stored GitHub accounts for `moizghumann` and `TangentConsulting` are also invalid
+- `mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs` passed: 10 tests, 0 failures
+- `mise exec -- mix test` passed: 279 tests, 0 failures, 2 skipped
+- `mise exec -- mix specs.check` passed: all public functions have `@spec` or exemption
 
-Because `gh auth status` failed during the required non-mutating preflight, local validation and live smoke were not run in this attempt. No Linear issue, Git branch, commit, push, or GitHub PR was created by live smoke.
+The auth blocker from the prior attempt is resolved. Live smoke did not proceed because no existing safe Phase 3.6 runner or command was found for exactly the first three lanes: docs, bug or test, and research.
 
-Prior blocked attempt:
+Existing live command reviewed:
 
-after explicit operator permission, the Codex command worker environment did not expose `RUN_REAL_SMOKE`, `LINEAR_API_KEY`, `GH_TOKEN`, or `GITHUB_TOKEN`, even though the user verified those variables in the Codex app terminal. Because the worker could not see the live-smoke gate or auth tokens, GitHub repo read and Linear team/status read were not attempted from the worker, and no mutation was allowed.
+- `make e2e` is a real external end-to-end test, but it is not an acceptable Phase 3.6 lane smoke runner.
+- It creates a temporary Linear project and issue under the live e2e team, asks Codex to use generic `linear_graphql`, moves the issue to a completed terminal state, and verifies a temporary file/comment.
+- It does not constrain execution to the first three Phase 3.6 lanes, does not exercise docs/bug-or-test/research lane policies, does not require docs/bug-test draft PR handoff evidence, and does not collect the required token/tool/finalization-gate evidence.
 
-Required environment/auth:
+No Linear issue, live-smoke branch, smoke commit, smoke push, or smoke PR was created by Layer C live smoke in this attempt.
 
-- `RUN_REAL_SMOKE=true`
-- Linear API key with access to team `Agent Workbench`
-- GitHub credentials with write access to `moizghumann/symphony`
-- Symphony configured for project `Symphony Agent Queue`
-- Exact Linear statuses available: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Rework`, `Merging`, `Blocked`, `Done`, `Duplicate`, `Canceled`
+Smallest safe opt-in live-smoke runner to add before mutation:
 
-Attempted preflight:
+- Refuse to run unless `RUN_REAL_SMOKE=true`.
+- Refuse to run unless `LINEAR_API_KEY` is present.
+- Refuse to run unless `GH_TOKEN` or `GITHUB_TOKEN` is present.
+- Run and pass non-mutating GitHub preflight before any mutation:
+  - `gh auth status`
+  - `gh repo view moizghumann/symphony --json nameWithOwner`
+- Run and pass non-mutating Linear preflight before any mutation:
+  - viewer query
+  - `Agent Workbench` team/state query
+  - exact status verification with `Canceled`, not `Cancelled`
+- Create or select only three live-smoke tickets for docs, bug or test, and research.
+- Stop after those three lanes; leave feature, refactor, chore, and the unselected bug/test counterpart not run.
+- For each smoke run, persist Linear identifier, lane, classification reason, final state, PR URL if repo changed, changed files, validation status, effective tokens, gross context tokens, cached input tokens, tool-call count, generic Linear GraphQL calls, narrow Linear lifecycle calls, budget state, finalization gate result, protocol violations, and protocol warnings.
+- Enforce docs behavior: repo-changing docs-only ticket, draft PR required, Human Review only after PR URL posted, generic Linear GraphQL = 0 on happy path, effective tokens <= 30k target.
+- Enforce bug/test behavior: failure signal or targeted test behavior required, validation behavior must match lane, draft PR required if repo changed.
+- Enforce research behavior: read-only by default, no repo file changes, no PR unless artifact requested, findings posted, Human Review only after findings handoff.
 
-```sh
-printenv | rg '^(LINEAR_API_KEY|GITHUB_TOKEN|GH_TOKEN|RUN_REAL_SMOKE|SYMPHONY_LIVE|SYMPHONY_RUN|OPENAI_API_KEY)='
-gh auth status --hostname github.com
-git ls-remote --heads origin main
-```
+Prior blocked attempts:
 
-Observed result:
-
-- live environment variables: not present in the Codex command worker environment
-- Codex CLI: present
-- GitHub repo read: not attempted because `GH_TOKEN`/`GITHUB_TOKEN` was not visible to the worker
-- Linear team/status read: not attempted because `LINEAR_API_KEY` was not visible to the worker
-- mutation status: no Linear issue, Git branch, commit, push, or GitHub PR was created
-
-Manual procedure:
-
-1. Create three fresh Linear issues in team `Agent Workbench`, project `Symphony Agent Queue`, initial state `Todo`: docs, bug or test, and research.
-2. Start Symphony only after confirming `RUN_REAL_SMOKE=true`:
-
-   ```sh
-   cd elixir
-   RUN_REAL_SMOKE=true mise exec -- mix run --no-halt
-   ```
-
-3. For each run, collect Linear identifier, lane, classification reason, final state, PR URL if repo changed, changed files, validation status, effective tokens, gross context tokens, cached input tokens, tool-call count, generic GraphQL calls, narrow lifecycle calls, budget state, finalization gate result, protocol violations, and protocol warnings.
-4. Stop after the first three smoke tests and review results before creating the remaining lane tickets.
+- One attempt had invalid `GH_TOKEN` during the required non-mutating preflight even though `GITHUB_TOKEN` was valid. Because the required non-mutating preflight failed, live smoke was not run in that attempt. Existing Layer A/B local validation remained valid, but was not rerun as part of that blocked live-smoke attempt.
+- In an earlier worker attempt, after explicit operator permission, the Codex command worker environment did not expose `RUN_REAL_SMOKE`, `LINEAR_API_KEY`, `GH_TOKEN`, or `GITHUB_TOKEN`, even though the user verified those variables in the Codex app terminal. Because the worker could not see the live-smoke gate or auth tokens, GitHub repo read and Linear team/status read were not attempted from the worker, and no mutation was allowed.
 
 ## Required Fixes Before Phase 4
 
-- Run Layer C real smoke tests with `RUN_REAL_SMOKE=true`.
+- Add the smallest safe opt-in Phase 3.6 live-smoke runner described above, or identify an existing equivalent command if one is added elsewhere.
+- Run Layer C real smoke tests with `RUN_REAL_SMOKE=true` for the first three lanes only: docs, bug or test, and research.
 - Do not proceed to Phase 4 if any real smoke reaches Human Review without required artifacts or exceeds budget without being marked `pass_with_budget_warning`.
 
 ## Recommendation
 
-Do not mark Phase 3.6 fully passed until real smoke tests run. The local validation suite is directionally correct and should be used as the preflight gate before live smoke testing.
+Do not mark Phase 3.6 fully passed until real smoke tests run. Phase 3.6 remains partial: preflight and local validation are green, but Layer C still needs a safe runner and real smoke evidence for docs, bug or test, and research before expanding to the remaining lanes.
