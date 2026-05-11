@@ -121,6 +121,26 @@ Runner follow-up validation, 2026-05-11:
   - observed: `9461`
   - final result: 283 tests, 1 failure, 2 skipped
 
+Latest Layer C live-smoke attempt, 2026-05-11:
+
+- Command: required non-mutating preflight from the Phase 3.6 operator instructions.
+- `RUN_REAL_SMOKE=true`
+- `CONFIRM_LIVE_SMOKE_MUTATION=` was empty in the command environment.
+- `LINEAR_API_KEY` present.
+- `GH_TOKEN` present.
+- `GITHUB_TOKEN` present.
+- `gh auth status` passed for GitHub account `moizghumann` using `GH_TOKEN`.
+- `gh repo view moizghumann/symphony --json nameWithOwner` passed with `{"nameWithOwner":"moizghumann/symphony"}`.
+- Linear viewer query passed for `Moiz Ghuman <moizghuman@gmail.com>`.
+- Linear team/status query passed for team `Agent Workbench` and returned the expected statuses: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Rework`, `Merging`, `Blocked`, `Done`, `Duplicate`, `Canceled`.
+
+Blocker:
+
+- `CONFIRM_LIVE_SMOKE_MUTATION=true` was required but missing from the command environment.
+- Per the live-smoke safety contract, no Linear or GitHub mutation was allowed.
+- No live-smoke runner command was invoked.
+- No Linear smoke issue, Linear state transition, Linear comment, smoke branch, smoke commit, smoke push, or smoke PR was created in this attempt.
+
 The auth blocker from the prior attempt is resolved. The missing-runner blocker is also addressed by the new guarded Mix task:
 
 ```sh
