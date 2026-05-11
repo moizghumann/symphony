@@ -96,6 +96,8 @@ Validated:
 
 real smoke tests attempted but not run to mutation
 
+Docs-lane repository smoke `AGE-6` records a docs-only commit and push with validation reported as not run.
+
 Latest preflight attempt, 2026-05-11:
 
 - `RUN_REAL_SMOKE=true`
