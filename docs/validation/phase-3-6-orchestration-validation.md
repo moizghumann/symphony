@@ -4,7 +4,7 @@
 
 partial
 
-Layer A unit tests and Layer B local dry-run simulations pass. Layer C real Linear/GitHub smoke tests were not run in this PR because they require explicit live credentials and mutating access.
+Layer A unit tests and Layer B local dry-run simulations pass. Layer C real Linear/GitHub smoke tests were not run because the live preflight is currently blocked by invalid GitHub CLI authentication.
 
 ## Test Matrix
 
@@ -94,9 +94,27 @@ Validated:
 
 ## Real Smoke Status
 
-real smoke tests not run
+real smoke tests attempted but not run to mutation
 
-reason: requires explicit `RUN_REAL_SMOKE=true` plus live Linear and GitHub credentials with permission to create issues, branches, commits, draft PRs, and Linear comments/state transitions.
+Latest preflight attempt, 2026-05-11:
+
+- `RUN_REAL_SMOKE=true`
+- `LINEAR_API_KEY` present
+- `GH_TOKEN` present
+- `GITHUB_TOKEN` present
+- `gh repo view moizghumann/symphony --json nameWithOwner` passed with `{"nameWithOwner":"moizghumann/symphony"}`
+- Linear viewer query passed for `Moiz Ghuman <moizghuman@gmail.com>`
+- Linear team/status query passed for team `Agent Workbench` and returned the expected statuses: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Rework`, `Merging`, `Blocked`, `Done`, `Duplicate`, `Canceled`
+- `gh auth status` failed because `GH_TOKEN` is invalid:
+  - `Failed to log in to github.com using token (GH_TOKEN)`
+  - `The token in GH_TOKEN is invalid.`
+  - default stored GitHub accounts for `moizghumann` and `TangentConsulting` are also invalid
+
+Because `gh auth status` failed during the required non-mutating preflight, local validation and live smoke were not run in this attempt. No Linear issue, Git branch, commit, push, or GitHub PR was created by live smoke.
+
+Prior blocked attempt:
+
+after explicit operator permission, the Codex command worker environment did not expose `RUN_REAL_SMOKE`, `LINEAR_API_KEY`, `GH_TOKEN`, or `GITHUB_TOKEN`, even though the user verified those variables in the Codex app terminal. Because the worker could not see the live-smoke gate or auth tokens, GitHub repo read and Linear team/status read were not attempted from the worker, and no mutation was allowed.
 
 Required environment/auth:
 
@@ -105,6 +123,22 @@ Required environment/auth:
 - GitHub credentials with write access to `moizghumann/symphony`
 - Symphony configured for project `Symphony Agent Queue`
 - Exact Linear statuses available: `Backlog`, `Todo`, `In Progress`, `Human Review`, `Rework`, `Merging`, `Blocked`, `Done`, `Duplicate`, `Canceled`
+
+Attempted preflight:
+
+```sh
+printenv | rg '^(LINEAR_API_KEY|GITHUB_TOKEN|GH_TOKEN|RUN_REAL_SMOKE|SYMPHONY_LIVE|SYMPHONY_RUN|OPENAI_API_KEY)='
+gh auth status --hostname github.com
+git ls-remote --heads origin main
+```
+
+Observed result:
+
+- live environment variables: not present in the Codex command worker environment
+- Codex CLI: present
+- GitHub repo read: not attempted because `GH_TOKEN`/`GITHUB_TOKEN` was not visible to the worker
+- Linear team/status read: not attempted because `LINEAR_API_KEY` was not visible to the worker
+- mutation status: no Linear issue, Git branch, commit, push, or GitHub PR was created
 
 Manual procedure:
 
