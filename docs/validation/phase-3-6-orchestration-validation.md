@@ -96,6 +96,8 @@ Validated:
 
 real smoke tests attempted but not run to mutation
 
+Docs-lane live smoke tracking, 2026-05-11: repository-changing docs runs record validation as `not run: docs-only change` and leave draft PR creation plus Linear handoff to Symphony after `SYMPHONY_HANDOFF_READY`.
+
 Latest preflight attempt, 2026-05-11:
 
 - `RUN_REAL_SMOKE=true`
