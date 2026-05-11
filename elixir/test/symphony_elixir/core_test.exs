@@ -878,6 +878,9 @@ defmodule SymphonyElixir.CoreTest do
     System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
 
     case scenario do
+      :clean ->
+        :ok
+
       :branch_failure ->
         File.write!(Path.join(repo, "README.md"), "# test\n\nwork on main\n")
 
@@ -1258,6 +1261,104 @@ defmodule SymphonyElixir.CoreTest do
       assert comment =~ "https://github.com/example/repo/pull/7"
       assert_receive {:memory_tracker_state_update, "issue-age-2", "Human Review"}
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "github handoff auto-commits dirty workspace and enriches phase36 artifact" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-github-handoff-phase36-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_handoff_repo!(test_root, :clean)
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+      File.mkdir_p!(bin_dir)
+      File.mkdir_p!(Path.join(repo, ".phase36"))
+
+      File.write!(Path.join(repo, "README.md"), "# test\n\nPhase 3.6 docs smoke.\n")
+
+      File.write!(
+        Path.join(repo, ".phase36/handoff.json"),
+        Jason.encode!(
+          %{
+            "lane" => "docs",
+            "linear_issue_identifier" => "AGE-36",
+            "status" => "repository_edit_complete_parent_handoff_pending",
+            "repo_changed" => true,
+            "branch_name" => nil,
+            "commit_sha" => nil,
+            "pr_url" => nil,
+            "changed_files" => ["README.md"],
+            "validation" => %{
+              "required" => false,
+              "status" => "not_run",
+              "command" => nil,
+              "reason" => "docs-only change"
+            },
+            "handoff" => %{
+              "linear_comment_posted" => false,
+              "final_state_requested" => false
+            },
+            "protocol_notes" => ["Symphony will finalize git and PR fields after handoff readiness."]
+          },
+          pretty: true
+        )
+      )
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+        printf 'https://github.com/example/repo/pull/36\\n'
+        exit 0
+      fi
+      exit 99
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-age-36",
+        identifier: "AGE-36",
+        title: "Phase 3.6 docs smoke",
+        state: "In Progress",
+        branch_name: "symphony/age-36",
+        url: "https://linear.app/symphonys/issue/AGE-36"
+      }
+
+      assert {:ok, "https://github.com/example/repo/pull/36"} =
+               SymphonyElixir.GitHubHandoff.complete(repo, issue, nil, auto_publish_from_main: true)
+
+      assert File.read!(gh_log) =~ "pr create --draft --head symphony/age-36 --base main"
+      assert String.trim(elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0)) == "README.md"
+      refute elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0) =~ ".phase36/handoff.json"
+
+      artifact = repo |> Path.join(".phase36/handoff.json") |> File.read!() |> Jason.decode!()
+      assert artifact["status"] == "handoff_complete"
+      assert artifact["branch_name"] == "symphony/age-36"
+      assert artifact["commit_sha"] =~ ~r/^[0-9a-f]{40}$/
+      assert artifact["pr_url"] == "https://github.com/example/repo/pull/36"
+      assert artifact["handoff"]["linear_comment_posted"] == true
+      assert artifact["handoff"]["final_state_requested"] == "Human Review"
+
+      assert_receive {:memory_tracker_comment, "issue-age-36", comment}
+      assert comment =~ "https://github.com/example/repo/pull/36"
+      assert_receive {:memory_tracker_state_update, "issue-age-36", "Human Review"}
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
       File.rm_rf(test_root)
     end
   end

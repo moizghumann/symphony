@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
     .ex .exs .erl .hrl .js .jsx .ts .tsx .mjs .cjs .json .lock .yml .yaml .toml .sql .sh .bash .zsh
     .py .rb .go .rs .java .kt .swift .c .cc .cpp .h .hpp .cs .php
   ]
+  @control_artifact_prefix ".phase36/"
 
   @spec evaluate(map(), String.t() | atom(), Contract.t()) :: {:ok, map()} | {:blocked, map()}
   def evaluate(run_state, target_state, %Contract{finalization_gate: false} = contract) when is_map(run_state) do
@@ -48,13 +49,34 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
 
   @spec code_bearing_changes?([String.t()]) :: boolean()
   def code_bearing_changes?(changed_files) when is_list(changed_files) do
-    Enum.any?(changed_files, fn file ->
+    changed_files
+    |> product_changed_files()
+    |> Enum.any?(fn file ->
       ext = file |> to_string() |> Path.extname() |> String.downcase()
       ext in @code_extensions
     end)
   end
 
   def code_bearing_changes?(_changed_files), do: false
+
+  @spec control_artifact?(String.t()) :: boolean()
+  def control_artifact?(file) when is_binary(file) do
+    normalized = normalize_changed_file(file)
+    normalized == ".phase36" or String.starts_with?(normalized, @control_artifact_prefix)
+  end
+
+  def control_artifact?(_file), do: false
+
+  @spec product_changed_files([String.t()]) :: [String.t()]
+  def product_changed_files(changed_files) when is_list(changed_files) do
+    changed_files
+    |> Enum.map(&normalize_changed_file/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.reject(&control_artifact?/1)
+    |> Enum.uniq()
+  end
+
+  def product_changed_files(_changed_files), do: []
 
   defp add_state_transition_violations(violations, run_state, target_state, contract) do
     StateTransitionGuard.validate(run_state, target_state, contract) ++ violations
@@ -473,9 +495,17 @@ defmodule SymphonyElixir.Protocol.FinalizationGate do
 
   defp changed_files(run_state) do
     case Map.get(run_state, :changed_files) || Map.get(run_state, "changed_files") do
-      files when is_list(files) -> Enum.map(files, &to_string/1)
+      files when is_list(files) -> product_changed_files(files)
       _ -> []
     end
+  end
+
+  defp normalize_changed_file(file) do
+    file
+    |> to_string()
+    |> String.trim()
+    |> String.replace("\\", "/")
+    |> String.trim_leading("./")
   end
 
   defp validation_required?(run_state, %Contract{validation_gate: true}) do

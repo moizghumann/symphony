@@ -58,6 +58,35 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert violation?(result, :docs_lane_source_change)
   end
 
+  test "docs lane ignores phase36 control artifact when checking source changes" do
+    run_state =
+      base_run_state(%{
+        lane: "docs",
+        changed_files: ["docs/foo.md", ".phase36/handoff.json"],
+        validation_required: false,
+        validation_status: :not_run,
+        validation_reason: "docs-only/text-only change"
+      })
+
+    assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    refute violation?(result, :docs_lane_source_change)
+    assert result.changed_files == ["docs/foo.md"]
+  end
+
+  test "docs lane still treats non-phase36 json as code config" do
+    run_state =
+      base_run_state(%{
+        lane: "docs",
+        changed_files: ["docs/foo.md", "config/example.json"],
+        validation_required: false,
+        validation_status: :not_run,
+        validation_reason: "docs-only/text-only change"
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :docs_lane_source_change)
+  end
+
   test "feature lane blocks runtime change when validation is missing" do
     run_state =
       base_run_state(%{
@@ -70,6 +99,31 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
     assert violation?(result, :validation_required_but_missing)
     assert violation?(result, :feature_validation_missing)
+  end
+
+  test "repo-changing lanes require branch commit pushed pr and Linear handoff before Human Review" do
+    run_state =
+      base_run_state(%{
+        lane: "feature",
+        changed_files: ["lib/product/runtime.ex"],
+        branch_name: nil,
+        commit_sha: nil,
+        branch_pushed: false,
+        pr_url: nil,
+        pr_created: false,
+        pr_posted_to_linear: false,
+        handoff_posted: false,
+        validation_status: :passed,
+        tests_added: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :branch_missing)
+    assert violation?(result, :commit_missing)
+    assert violation?(result, :branch_not_pushed)
+    assert violation?(result, :pr_required_but_missing)
+    assert violation?(result, :pr_url_not_posted_to_linear)
+    assert violation?(result, :handoff_missing)
   end
 
   test "bug lane blocks fix without failure signal" do

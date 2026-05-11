@@ -267,7 +267,12 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
         github_preflight: fn -> :ok end,
         linear_graphql: &fake_linear_graphql/2,
         run_agent: fn issue, _preflight, _output_path ->
-          {:ok, artifact_runner_result(issue, {:artifact, %{"lane" => "docs"}})}
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact, %{"lane" => "docs", "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md", ".phase36/handoff.json"]}},
+             %{"changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md", ".phase36/handoff.json"]}
+           )}
         end,
         write_file: &File.write!/2
       })
@@ -279,7 +284,10 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["handoff_artifact_valid"] == true
     assert lane_result["finalization_gate_result"] == "ok"
     assert lane_result["repo_changed"] == true
+    assert lane_result["product_changed_files"] == ["docs/validation/phase-3-6-orchestration-validation.md"]
+    assert lane_result["control_artifacts"] == [".phase36/handoff.json"]
     refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+    refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "docs_lane_source_change"))
 
     File.rm(output_path)
   end
@@ -320,6 +328,43 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     File.rm(output_path)
   end
 
+  test "stops the requested wave after the first failed lane" do
+    output_path = temp_output_path()
+    agent_runs = Agent.start_link(fn -> [] end) |> elem(1)
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs,test,research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          Agent.update(agent_runs, &[issue.identifier | &1])
+          workspace_path = temp_workspace_path()
+          File.mkdir_p!(workspace_path)
+
+          {:ok,
+           %{
+             "workspace_path" => workspace_path,
+             "tool_call_count" => 1,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 1,
+             "budget_state" => "ok",
+             "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    assert Enum.map(evidence["results"], & &1["lane"]) == ["docs"]
+    assert Agent.get(agent_runs, &length/1) == 1
+    assert hd(evidence["results"])["finalization_gate_result"] == "blocked"
+
+    File.rm(output_path)
+  end
+
   test "fails a lane when the handoff artifact contains invalid json" do
     output_path = temp_output_path()
 
@@ -341,6 +386,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["handoff_artifact_valid"] == false
     assert lane_result["finalization_gate_result"] == "blocked"
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "invalid_handoff_artifact_json"))
+    assert lane_result["control_artifacts"] == [".phase36/handoff.json"]
 
     File.rm(output_path)
   end

@@ -8,6 +8,8 @@ defmodule SymphonyElixir.GitHubHandoff do
   alias SymphonyElixir.{Linear.Issue, SSH, Tracker}
   alias SymphonyElixir.Protocol.{Contract, FinalizationGate, Validation}
 
+  @phase36_handoff_path ".phase36/handoff.json"
+
   @type worker_host :: String.t() | nil
   @type result :: :no_repo_changes | {:ok, String.t()} | {:error, term()}
 
@@ -19,6 +21,8 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   @spec complete(Path.t(), Issue.t(), worker_host(), keyword()) :: result()
   def complete(workspace, %Issue{} = issue, worker_host, opts) when is_binary(workspace) and is_list(opts) do
+    contract = Contract.current()
+
     with :ok <- ensure_git_repo(workspace, worker_host),
          {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host),
          true <- artifacts.repo_changed,
@@ -28,6 +32,17 @@ defmodule SymphonyElixir.GitHubHandoff do
          :ok <- ensure_pushed(workspace, branch, worker_host, opts),
          {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url, opts),
+         :ok <-
+           update_phase36_handoff_artifact(workspace, %{
+             branch_name: branch,
+             commit_sha: commit_sha,
+             pr_url: pr_url,
+             changed_files: artifacts.changed_files,
+             linear_comment_posted: true,
+             final_state_requested: contract.review_state
+           }),
+         :ok <- ensure_committed(workspace, worker_host, issue, opts),
+         :ok <- ensure_pushed(workspace, branch, worker_host, opts),
          :ok <-
            move_to_human_review(
              issue,
@@ -107,7 +122,10 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp changed_files(workspace, worker_host) do
     case run(workspace, "git", ["diff", "--name-only", "origin/main...HEAD"], worker_host) do
       {:ok, output} ->
-        changed_files = parse_changed_files(output)
+        changed_files =
+          output
+          |> parse_changed_files()
+          |> FinalizationGate.product_changed_files()
 
         if changed_files == [] do
           changed_files_from_status(workspace, worker_host)
@@ -123,15 +141,7 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp changed_files_from_status(workspace, worker_host) do
     case run(workspace, "git", ["status", "--porcelain"], worker_host) do
       {:ok, output} ->
-        files =
-          output
-          |> String.split("\n", trim: true)
-          |> Enum.map(&String.slice(&1, 3..-1//1))
-          |> Enum.map(&String.trim/1)
-          |> Enum.reject(&(&1 == ""))
-          |> Enum.uniq()
-
-        {:ok, files}
+        {:ok, output |> parse_status_changed_files() |> FinalizationGate.product_changed_files()}
 
       {:error, reason} ->
         {:error, reason}
@@ -141,6 +151,15 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp parse_changed_files(output) when is_binary(output) do
     output
     |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp parse_status_changed_files(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.slice(&1, 3..-1//1))
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
@@ -204,11 +223,16 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp ensure_committed(workspace, worker_host, issue, opts) do
     case run(workspace, "git", ["status", "--porcelain"], worker_host) do
       {:ok, output} ->
-        if String.trim(output) == "" do
+        product_files =
+          output
+          |> parse_status_changed_files()
+          |> FinalizationGate.product_changed_files()
+
+        if product_files == [] do
           :ok
         else
           if Keyword.get(opts, :auto_publish_from_main, false) do
-            with :ok <- run(workspace, "git", ["add", "-A"], worker_host),
+            with :ok <- stage_product_changes(workspace, worker_host),
                  :ok <- commit_changes(workspace, issue, worker_host) do
               :ok
             end
@@ -219,6 +243,13 @@ defmodule SymphonyElixir.GitHubHandoff do
 
       {:error, reason} ->
         {:error, {:git_commit_failed, reason}}
+    end
+  end
+
+  defp stage_product_changes(workspace, worker_host) do
+    case run(workspace, "git", ["add", "-A", "--", ":/", ":!.phase36", ":!.phase36/**"], worker_host) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:git_stage_failed, reason}}
     end
   end
 
@@ -431,6 +462,46 @@ defmodule SymphonyElixir.GitHubHandoff do
       {:ok, {output, status}} -> {:error, {status, output}}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp update_phase36_handoff_artifact(workspace, updates) do
+    path = Path.join(workspace, @phase36_handoff_path)
+
+    if File.exists?(path) do
+      with {:ok, body} <- File.read(path),
+           {:ok, %{} = artifact} <- Jason.decode(body),
+           :ok <- write_phase36_handoff_artifact(path, artifact, updates) do
+        :ok
+      else
+        _ -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp write_phase36_handoff_artifact(path, artifact, updates) do
+    handoff =
+      artifact
+      |> Map.get("handoff", %{})
+      |> Map.merge(%{
+        "linear_comment_posted" => updates.linear_comment_posted,
+        "final_state_requested" => updates.final_state_requested
+      })
+
+    artifact =
+      artifact
+      |> Map.merge(%{
+        "status" => "handoff_complete",
+        "repo_changed" => true,
+        "branch_name" => updates.branch_name,
+        "commit_sha" => updates.commit_sha,
+        "pr_url" => updates.pr_url,
+        "changed_files" => updates.changed_files,
+        "handoff" => handoff
+      })
+
+    File.write(path, Jason.encode!(artifact, pretty: true))
   end
 
   defp extract_url(output) when is_binary(output) do

@@ -334,8 +334,15 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     shell(deps).info("Phase 3.6 preflight passed; live mutation gates are satisfied.")
 
     results =
-      Enum.map(lanes, fn lane ->
-        run_lane!(lane, preflight, output_path, deps)
+      Enum.reduce_while(lanes, [], fn lane, results ->
+        result = run_lane!(lane, preflight, output_path, deps)
+        results = results ++ [result]
+
+        if lane_failed?(result) do
+          {:halt, results}
+        else
+          {:cont, results}
+        end
       end)
 
     evidence = %{
@@ -406,6 +413,14 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         end
     end
   end
+
+  defp lane_failed?(result) when is_map(result) do
+    Map.get(result, "finalization_gate_result") == "blocked" or
+      Map.get(result, "handoff_artifact_valid") == false or
+      Map.get(result, "runner_status") in ["timeout", "error"]
+  end
+
+  defp lane_failed?(_result), do: true
 
   defp selected_lane_values(opts, deps) do
     case Keyword.get_values(opts, :lane) do
@@ -948,7 +963,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
       Scope:
       - Change only documentation under docs/.
-      - Leave branch creation, commit, push, and draft PR publication to the parent handoff.
+      - Leave final commit, push, draft PR publication, Linear handoff, and final state transition to Symphony after `SYMPHONY_HANDOFF_READY`.
       - Emit SYMPHONY_HANDOFF_READY only after the repository edit is complete.
 
       Validation:
@@ -1085,13 +1100,14 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     pr_url = artifact_value(artifact_result, ["pr_url"]) || find_pr_url(comments) || Map.get(telemetry, "pr_url")
     changed_files = artifact_value(artifact_result, ["changed_files"])
     observed_changed_files = Map.get(telemetry, "changed_files") || []
+    product_changed_files = effective_changed_files(changed_files, observed_changed_files)
+    control_artifacts = control_artifacts(changed_files, observed_changed_files, artifact_result)
     validation = artifact_value(artifact_result, ["validation"]) || Map.get(telemetry, "validation") || %{}
     artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
-    repo_changed = repo_changed?(artifact_repo_changed, observed_changed_files, pr_url)
+    repo_changed = repo_changed?(artifact_repo_changed, product_changed_files, pr_url)
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
-    effective_changed_files = effective_changed_files(changed_files, observed_changed_files)
     expected_final_state = expected_final_state(runner_result, final_state)
-    external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, effective_changed_files, expected_final_state, deps)
+    external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, product_changed_files, expected_final_state, deps)
 
     gate_result =
       %{
@@ -1099,7 +1115,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         current_state: expected_final_state,
         available_states: issue.available_states,
         repo_changed: repo_changed,
-        changed_files: effective_changed_files,
+        changed_files: product_changed_files,
         pr_url: pr_url,
         branch_name: artifact_value(artifact_result, ["branch_name"]) || Map.get(telemetry, "branch_name"),
         commit_sha: artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
@@ -1129,7 +1145,9 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "pr_url" => pr_url,
         "branch_name" => artifact_value(artifact_result, ["branch_name"]) || Map.get(telemetry, "branch_name"),
         "commit_sha" => artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
-        "changed_files" => effective_changed_files,
+        "changed_files" => product_changed_files,
+        "product_changed_files" => product_changed_files,
+        "control_artifacts" => control_artifacts,
         "validation_status" => validation_status(validation),
         "validation_command_result" => Map.get(validation, "command_result"),
         "validation_command" => Map.get(validation, "command"),
@@ -1295,7 +1313,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   end
 
   defp validate_handoff_artifact(artifact, lane, issue, _classification, telemetry) do
-    observed_changed_files = Map.get(telemetry, "changed_files") || []
+    observed_changed_files = FinalizationGate.product_changed_files(Map.get(telemetry, "changed_files") || [])
     validation = Map.get(artifact, "validation") || %{}
     handoff = Map.get(artifact, "handoff") || %{}
     repo_changed = truthy?(Map.get(artifact, "repo_changed"))
@@ -1463,9 +1481,15 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp github_verification_violations(verification, context) do
     changed_files = Map.get(context, :changed_files) || []
     external_changed_files = list_field(verification, "changed_files")
+    external_product_changed_files = FinalizationGate.product_changed_files(external_changed_files)
     issue = Map.get(context, :issue)
 
     []
+    |> maybe_add_violation(
+      Enum.any?(external_changed_files, &FinalizationGate.control_artifact?/1),
+      "github_control_artifacts_committed",
+      "GitHub PR changed files included Phase 3.6 control artifacts."
+    )
     |> maybe_add_violation(not truthy?(Map.get(verification, "branch_exists")), "github_branch_missing", "GitHub verification could not find the reported branch.")
     |> maybe_add_violation(not truthy?(Map.get(verification, "commit_exists")), "github_commit_missing", "GitHub verification could not find the reported commit.")
     |> maybe_add_violation(not truthy?(Map.get(verification, "pr_exists")), "github_pr_missing", "GitHub verification could not find the reported pull request.")
@@ -1481,12 +1505,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     )
     |> maybe_add_violation(not pr_links_issue?(verification, issue), "github_pr_missing_linear_link", "GitHub verification requires the PR title/body to link the Linear issue.")
     |> maybe_add_violation(
-      external_changed_files != [] and Enum.sort(external_changed_files) != Enum.sort(changed_files),
+      external_product_changed_files != [] and Enum.sort(external_product_changed_files) != Enum.sort(changed_files),
       "github_changed_files_mismatch",
       "GitHub PR changed files did not match the handoff artifact."
     )
     |> maybe_add_violation(
-      Map.get(context, :lane) == "docs" and FinalizationGate.code_bearing_changes?(external_changed_files),
+      Map.get(context, :lane) == "docs" and FinalizationGate.code_bearing_changes?(external_product_changed_files),
       "github_changed_files_lane_mismatch",
       "Docs lane PR changed code-bearing files."
     )
@@ -1564,12 +1588,31 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   end
 
   defp effective_changed_files(changed_files, observed_changed_files) do
-    cond do
-      non_empty_list?(observed_changed_files) -> observed_changed_files
-      is_list(changed_files) -> changed_files
-      true -> []
-    end
+    observed_changed_files
+    |> changed_files_or(changed_files)
+    |> FinalizationGate.product_changed_files()
   end
+
+  defp changed_files_or(files, _fallback) when is_list(files) and files != [], do: files
+  defp changed_files_or(_files, fallback) when is_list(fallback), do: fallback
+  defp changed_files_or(_files, _fallback), do: []
+
+  defp control_artifacts(changed_files, observed_changed_files, artifact_result) do
+    artifact_files =
+      if handoff_artifact_exists?(artifact_result) do
+        [@handoff_artifact_relpath]
+      else
+        []
+      end
+
+    (artifact_files ++ List.wrap(changed_files) ++ List.wrap(observed_changed_files))
+    |> Enum.map(&to_string/1)
+    |> Enum.filter(&FinalizationGate.control_artifact?/1)
+    |> Enum.uniq()
+  end
+
+  defp handoff_artifact_exists?(%{"path" => path}) when is_binary(path), do: File.exists?(path)
+  defp handoff_artifact_exists?(_artifact_result), do: false
 
   defp handoff_artifact_path(workspace_path) when is_binary(workspace_path), do: Path.join(workspace_path, @handoff_artifact_relpath)
   defp handoff_artifact_path(_workspace_path), do: @handoff_artifact_relpath
@@ -1714,11 +1757,22 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       end
 
       Workflow.set_workflow_file_path(workflow_path)
-      :ok = AgentRunner.run(issue, self(), max_turns: lane_max_turns(issue), auto_publish_from_main: true)
 
-      {:ok,
-       collect_runtime_messages(issue.id)
-       |> telemetry_from_messages()}
+      case AgentRunner.run(issue, self(), max_turns: lane_max_turns(issue), auto_publish_from_main: true) do
+        :ok ->
+          {:ok,
+           collect_runtime_messages(issue.id)
+           |> telemetry_from_messages()}
+
+        other ->
+          {:error, {:unexpected_agent_runner_result, other}, collect_runtime_messages(issue.id) |> telemetry_from_messages()}
+      end
+    rescue
+      error ->
+        {:error, {error, __STACKTRACE__}, collect_runtime_messages(issue.id) |> telemetry_from_messages()}
+    catch
+      kind, reason ->
+        {:error, {kind, reason}, collect_runtime_messages(issue.id) |> telemetry_from_messages()}
     after
       restart_orchestrator_if_needed()
       Workflow.set_workflow_file_path(original_workflow_path)
@@ -1752,9 +1806,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     workspace:
       root: #{workspace_root}
     hooks:
-      timeout_ms: 180000
+      timeout_ms: 600000
       after_create: |
-        git clone git@github-personal:moizghumann/symphony.git .
+        git clone --branch main --single-branch git@github-personal:moizghumann/symphony.git .
+        git rev-parse --verify HEAD
+        test -f elixir/mix.exs
         if command -v mise >/dev/null 2>&1; then
           cd elixir && mise trust && mise exec -- mix deps.get
         fi
@@ -1793,9 +1849,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     Follow the lane packet exactly. Do not start Phase 4.
     Do not weaken protocol gates. Do not fake live-smoke success.
     The current working directory is already the managed repository clone.
-    Make the requested file edit only. Leave branch creation, commit, push, and draft PR publication to the parent handoff.
+    Make the requested lane-scoped edit only.
     Do not create a second clone or work from `/tmp` for repository changes.
     Before emitting `SYMPHONY_HANDOFF_READY`, write `.phase36/handoff.json` in the managed workspace.
+    For repo-changing lanes, this artifact is the pre-handoff contract: keep every required key present, use `null` only for branch/commit/PR values that Symphony finalizes after `SYMPHONY_HANDOFF_READY`, and explain those provisional values in `protocol_notes`.
     The handoff artifact must be valid JSON and include:
     - `lane`
     - `linear_issue_identifier`
