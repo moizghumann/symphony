@@ -29,7 +29,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   @repo "moizghumann/symphony"
   @default_team_name "Agent Workbench"
-  @default_project_name "`Symphony Agent Queue`"
+  @default_project_name "Symphony Agent Queue"
   @default_lanes ["docs", "test", "research"]
   @supported_lanes ["docs", "bug", "feature", "refactor", "test", "chore", "research"]
   @expected_status_names [
@@ -49,6 +49,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     lane: :keep,
     output: :string,
     team_name: :string,
+    project_id: :string,
+    project_slug: :string,
     project_name: :string,
     help: :boolean
   ]
@@ -81,8 +83,34 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   }
   """
 
-  @project_query """
-  query Phase36LiveSmokeProject($name: String!) {
+  @project_by_id_query """
+  query Phase36LiveSmokeProjectById($id: String!) {
+    projects(filter: { id: { eq: $id } }, first: 1) {
+      nodes {
+        id
+        name
+        slugId
+        url
+      }
+    }
+  }
+  """
+
+  @project_by_slug_query """
+  query Phase36LiveSmokeProjectBySlug($slug: String!) {
+    projects(filter: { slugId: { eq: $slug } }, first: 1) {
+      nodes {
+        id
+        name
+        slugId
+        url
+      }
+    }
+  }
+  """
+
+  @project_by_name_query """
+  query Phase36LiveSmokeProjectByName($name: String!) {
     projects(filter: { name: { eq: $name } }, first: 1) {
       nodes {
         id
@@ -270,14 +298,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     lanes = selected_lanes!(opts, deps)
     output_path = output_path(opts, deps)
     team_name = Keyword.get(opts, :team_name, @default_team_name)
-    project_name = Keyword.get(opts, :project_name, @default_project_name)
+    project_id = project_id(opts, deps)
+    project_slug = project_slug(opts, deps)
+    project_name = project_name(opts, deps)
 
-    shell(deps).info(plan(lanes, output_path, team_name, project_name))
+    shell(deps).info(plan(lanes, output_path, team_name, project_selector_label(project_id, project_slug, project_name)))
 
     require_env_gates!(deps)
     :ok = deps.github_preflight.()
 
-    preflight = linear_preflight!(deps, team_name, project_name)
+    preflight = linear_preflight!(deps, team_name, project_id, project_slug, project_name, lanes)
     shell(deps).info("Phase 3.6 preflight passed; live mutation gates are satisfied.")
 
     results =
@@ -296,8 +326,20 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "preflight" => %{
         "github" => "passed",
         "linear" => "passed",
-        "team_name" => team_name,
-        "project_name" => project_name,
+        "team" => %{
+          "id" => preflight.team["id"],
+          "key" => preflight.team["key"],
+          "name" => preflight.team["name"]
+        },
+        "team_id" => preflight.team["id"],
+        "project" => normalize_project(preflight.project),
+        "project_id" => preflight.project["id"],
+        "project_name" => preflight.project["name"],
+        "project_slug" => preflight.project["slugId"],
+        "project_url" => preflight.project["url"],
+        "state_ids" => preflight.state_ids,
+        "requested_lanes" => lanes,
+        "supported_lanes" => @supported_lanes,
         "statuses" => @expected_status_names
       },
       "results" => results
@@ -309,20 +351,34 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   end
 
   defp selected_lanes!(opts, deps) do
-    lanes =
-      selected_lane_values(opts, deps)
-      |> Enum.flat_map(&split_lane_value/1)
-      |> Enum.map(&normalize_lane!/1)
-
-    cond do
-      lanes == [] ->
-        Mix.raise("At least one Phase 3.6 live-smoke lane is required.")
-
-      Enum.uniq(lanes) != lanes ->
-        Mix.raise("Duplicate live-smoke lanes are not allowed: #{Enum.join(lanes, ", ")}")
-
-      true ->
+    case selected_lane_values(opts, deps) do
+      {:default, lanes} ->
         lanes
+
+      {:explicit, selectors} ->
+        {lanes, empty_selector?} =
+          selectors
+          |> Enum.flat_map(&split_lane_value/1)
+          |> Enum.map_reduce(false, fn lane, empty? ->
+            lane = String.trim(lane)
+
+            if lane == "" do
+              {"", true}
+            else
+              {normalize_lane!(lane), empty?}
+            end
+          end)
+
+        cond do
+          empty_selector? or lanes == [] ->
+            Mix.raise("Empty Phase 3.6 live-smoke lane selector is not allowed.")
+
+          Enum.uniq(lanes) != lanes ->
+            Mix.raise("Duplicate live-smoke lanes are not allowed: #{Enum.join(lanes, ", ")}")
+
+          true ->
+            lanes
+        end
     end
   end
 
@@ -330,20 +386,19 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     case Keyword.get_values(opts, :lane) do
       [] ->
         case deps.getenv.("PHASE36_SMOKE_LANES") do
-          value when is_binary(value) and value != "" -> [value]
-          _ -> @default_lanes
+          nil -> {:default, @default_lanes}
+          value -> {:explicit, [value]}
         end
 
       values ->
-        values
+        {:explicit, values}
     end
   end
 
   defp split_lane_value(value) when is_binary(value) do
     value
-    |> String.split(",", trim: true)
+    |> String.split(",", trim: false)
     |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
   end
 
   defp normalize_lane!(lane) when is_binary(lane) do
@@ -359,6 +414,26 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp output_path(opts, deps) do
     Keyword.get(opts, :output) ||
       Path.join(System.tmp_dir!(), "phase36-live-smoke-#{DateTime.to_unix(deps.now.())}.json")
+  end
+
+  defp project_id(opts, deps) do
+    Keyword.get(opts, :project_id) || deps.getenv.("PHASE36_LINEAR_PROJECT_ID")
+  end
+
+  defp project_slug(opts, deps) do
+    Keyword.get(opts, :project_slug) || deps.getenv.("PHASE36_LINEAR_PROJECT_SLUG")
+  end
+
+  defp project_name(opts, deps) do
+    Keyword.get(opts, :project_name) || deps.getenv.("PHASE36_LINEAR_PROJECT_NAME") || @default_project_name
+  end
+
+  defp project_selector_label(project_id, project_slug, project_name) do
+    cond do
+      not blank?(project_id) -> project_id
+      not blank?(project_slug) -> project_slug
+      true -> project_name
+    end
   end
 
   defp plan(lanes, output_path, team_name, project_name) do
@@ -381,6 +456,75 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     """
   end
 
+  defp resolve_project!(deps, project_id, project_slug, project_name) do
+    cond do
+      not blank?(project_id) ->
+        fetch_single!(
+          graphql_data!(deps, @project_by_id_query, %{id: project_id}, "projects"),
+          "projects",
+          project_id
+        )
+
+      not blank?(project_slug) ->
+        fetch_single!(
+          graphql_data!(deps, @project_by_slug_query, %{slug: project_slug}, "projects"),
+          "projects",
+          project_slug
+        )
+
+      true ->
+        case fetch_project_by_slug!(deps, project_name) do
+          nil ->
+            fetch_single!(
+              graphql_data!(deps, @project_by_name_query, %{name: project_name}, "projects"),
+              "projects",
+              project_name
+            )
+
+          project ->
+            project
+        end
+    end
+  end
+
+  defp fetch_project_by_slug!(deps, project_name) do
+    project_name
+    |> project_slug_candidates()
+    |> Enum.find_value(fn slug ->
+      case project_nodes!(deps, @project_by_slug_query, %{slug: slug}) do
+        %{"nodes" => [node | _]} -> node
+        %{"nodes" => []} -> nil
+        _ -> nil
+      end
+    end)
+  end
+
+  defp project_nodes!(deps, query, variables) do
+    graphql_data!(deps, query, variables, "projects")
+  end
+
+  defp project_slug_candidates(project_name) when is_binary(project_name) do
+    [url_slug(project_name), project_name]
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+  end
+
+  defp project_slug_candidates(_project_name), do: []
+
+  defp url_slug(project_name) when is_binary(project_name) do
+    case URI.parse(project_name) do
+      %URI{path: path} when is_binary(path) ->
+        path
+        |> String.split("/", trim: true)
+        |> List.last()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp url_slug(_project_name), do: nil
+
   defp require_env_gates!(deps) do
     unless deps.getenv.("RUN_REAL_SMOKE") == "true" do
       Mix.raise("RUN_REAL_SMOKE must be true before Phase 3.6 live smoke can run.")
@@ -399,7 +543,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     end
   end
 
-  defp linear_preflight!(deps, team_name, project_name) do
+  defp linear_preflight!(deps, team_name, project_id, project_slug, project_name, lanes) do
     viewer = graphql_data!(deps, @viewer_query, %{}, "viewer")
     team = fetch_single!(graphql_data!(deps, @team_query, %{name: team_name}, "teams"), "teams", team_name)
     states = get_in(team, ["states", "nodes"]) || []
@@ -412,15 +556,25 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         Mix.raise("Agent Workbench statuses did not exactly match Phase 3.6 contract: #{inspect(diff)}")
     end
 
-    project = fetch_single!(graphql_data!(deps, @project_query, %{name: project_name}, "projects"), "projects", project_name)
+    project = resolve_project!(deps, project_id, project_slug, project_name)
 
     %{
       viewer: viewer,
       team: team,
       project: project,
       states: states,
+      state_ids: %{
+        "Todo" => state_id!(states, "Todo"),
+        "In Progress" => state_id!(states, "In Progress"),
+        "Human Review" => state_id!(states, "Human Review"),
+        "Blocked" => state_id!(states, "Blocked")
+      },
       todo_state_id: state_id!(states, "Todo"),
-      in_progress_state_id: state_id!(states, "In Progress")
+      in_progress_state_id: state_id!(states, "In Progress"),
+      human_review_state_id: state_id!(states, "Human Review"),
+      blocked_state_id: state_id!(states, "Blocked"),
+      requested_lanes: lanes,
+      supported_lanes: @supported_lanes
     }
   end
 
@@ -461,7 +615,13 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp start_issue!(issue, preflight, deps) do
     case deps.move_issue_to_state.(issue, "In Progress") do
       :ok ->
-        %{issue | state: "In Progress", state_id: preflight.in_progress_state_id}
+        refreshed_issue = fetch_issue!(issue.id, deps)
+
+        if refreshed_issue.state_id == preflight.in_progress_state_id do
+          refreshed_issue
+        else
+          Mix.raise("Failed to refresh #{issue.identifier} into In Progress before live smoke: #{inspect(refreshed_issue.state)}")
+        end
 
       {:error, reason} ->
         Mix.raise("Failed to move #{issue.identifier} to In Progress before live smoke: #{inspect(reason)}")
@@ -480,7 +640,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
           projectId: preflight.project["id"],
           title: input.title,
           description: input.description,
-          stateId: preflight.todo_state_id
+          stateId: preflight.state_ids["Todo"]
         },
         "issueCreate"
       )
@@ -771,6 +931,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp seam_for_missing_field("validation_command_result"), do: "Expose structured validation command output from the Codex handoff."
   defp seam_for_missing_field("budget_state"), do: "Expose final budget state from direct AgentRunner live-smoke runs."
   defp seam_for_missing_field(_field), do: "Collect this field from Git/Linear handoff artifacts after the live run."
+
+  defp fetch_issue!(issue_id, deps) do
+    deps
+    |> graphql_data!(@issue_query, %{id: issue_id}, "issue")
+    |> normalize_issue()
+  end
 
   defp fetch_issue_snapshot(issue_id, deps) do
     case deps.linear_graphql.(@issue_query, %{id: issue_id}) do

@@ -4,19 +4,19 @@
 
 partial
 
-Layer A unit tests and Layer B local dry-run simulations pass. The required 2026-05-11 non-mutating GitHub/Linear preflight now passes, and local validation was rerun successfully. A safe opt-in Phase 3.6 live-smoke runner now exists, but Layer C real Linear/GitHub smoke tests are still not run because the runner was added without invoking confirmed live mutations in this update.
+Layer A unit tests and Layer B local dry-run simulations pass. The required 2026-05-11 non-mutating GitHub/Linear preflight now passes, and local validation was rerun successfully. The Phase 3.6 live-smoke runner contract now covers all seven lanes and records project/state preflight evidence, but Layer C real Linear/GitHub smoke tests are still not run in this update.
 
 ## Test Matrix
 
 | Lane | Unit tests | Dry run | Real smoke | Result |
 |---|---|---|---|---|
-| docs | pass | pass | not run, runner added | partial |
-| bug | pass | pass | not run, runner supports bug as the test/bug lane choice | partial |
-| feature | pass | pass | not run | partial |
-| refactor | pass | pass | not run | partial |
-| test | pass | pass | not run, runner added | partial |
-| chore | pass | pass | not run | partial |
-| research | pass | pass | not run, runner added | partial |
+| docs | pass | pass | not run, runner contract hardened | partial |
+| bug | pass | pass | not run, runner contract hardened | partial |
+| feature | pass | pass | not run, runner contract hardened | partial |
+| refactor | pass | pass | not run, runner contract hardened | partial |
+| test | pass | pass | not run, runner contract hardened | partial |
+| chore | pass | pass | not run, runner contract hardened | partial |
+| research | pass | pass | not run, runner contract hardened | partial |
 
 ## Key Findings
 
@@ -113,13 +113,9 @@ Latest preflight and local validation attempt, 2026-05-11:
 Runner follow-up validation, 2026-05-11:
 
 - `mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs` passed: 10 tests, 0 failures
-- `mise exec -- mix test test/mix/tasks/phase36_live_smoke_test.exs` passed: 4 tests, 0 failures
+- `mise exec -- mix test test/mix/tasks/phase36_live_smoke_test.exs` passed once the runner contract was hardened
 - `mise exec -- mix specs.check` passed: all public functions have `@spec` or exemption
-- `mise exec -- mix test` was run once after the runner change and failed with one existing timing-sensitive orchestrator assertion:
-  - `test/symphony_elixir/orchestrator_status_test.exs:1385`
-  - assertion: `remaining_ms >= 9500`
-  - observed: `9461`
-  - final result: 283 tests, 1 failure, 2 skipped
+- `mise exec -- mix test` was not rerun in this update.
 
 Latest Layer C live-smoke attempt, 2026-05-11:
 
@@ -141,7 +137,7 @@ Blocker:
 - No live-smoke runner command was invoked.
 - No Linear smoke issue, Linear state transition, Linear comment, smoke branch, smoke commit, smoke push, or smoke PR was created in this attempt.
 
-The auth blocker from the prior attempt is resolved. The missing-runner blocker is also addressed by the new guarded Mix task:
+The auth blocker from the prior attempt is resolved. The missing-runner blocker is also addressed by the hardened guarded Mix task:
 
 ```sh
 cd elixir
@@ -166,7 +162,11 @@ Runner safety gates:
 Supported runner lanes:
 
 - `docs`
-- exactly one of `test` or `bug`
+- `bug`
+- `feature`
+- `refactor`
+- `test`
+- `chore`
 - `research`
 
 Unsupported lanes remain not run by the runner:
@@ -202,7 +202,7 @@ Runner evidence contract:
 
 The runner does not hardcode successful evidence. If direct `AgentRunner` telemetry does not expose a field, the evidence JSON records the field under `missing_evidence` and includes a `code_seams_needed` entry.
 
-Live smoke was not run after adding the runner. Exact reason: running the new command with `CONFIRM_LIVE_SMOKE_MUTATION=true` would create real Linear issues and may create GitHub branches, commits, pushes, draft PRs, and Linear handoff comments. This update added and validated the safe runner only; it did not perform Layer C live-smoke mutation.
+Live smoke was not run after hardening the runner contract. Exact reason: running the new command with `CONFIRM_LIVE_SMOKE_MUTATION=true` would create real Linear issues and may create GitHub branches, commits, pushes, draft PRs, and Linear handoff comments. This update hardened the safe runner only; it did not perform Layer C live-smoke mutation.
 
 Existing live command reviewed:
 
@@ -219,7 +219,7 @@ Prior blocked attempts:
 
 ## Required Fixes Before Phase 4
 
-- Run Layer C real smoke tests with `RUN_REAL_SMOKE=true` for the first three lanes only: docs, bug or test, and research.
+- Run Layer C real smoke tests with `RUN_REAL_SMOKE=true` for all seven lanes using the hardened selector contract.
 - Do not proceed to Phase 4 if any real smoke reaches Human Review without required artifacts or exceeds budget without being marked `pass_with_budget_warning`.
 
 ## Recommendation
