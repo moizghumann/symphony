@@ -2,6 +2,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   use Mix.Task
 
   alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.Config
   alias SymphonyElixir.LaneClassifier
   alias SymphonyElixir.LanePolicy
   alias SymphonyElixir.Linear.Issue
@@ -32,6 +33,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   @default_team_name "Agent Workbench"
   @default_project_name "Symphony Agent Queue"
   @default_lanes ["docs", "test", "research"]
+  @default_lane_runtime_ms 1_800_000
+  @default_heartbeat_interval_ms 60_000
   @supported_lanes ["docs", "bug", "feature", "refactor", "test", "chore", "research"]
   @artifact_gate_fields [
     "affected_files_inspected",
@@ -324,7 +327,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     shell(deps).info(plan(lanes, output_path, team_name, project_selector_label(project_id, project_slug, project_name)))
 
     require_env_gates!(deps)
-    :ok = deps.github_preflight.()
+    github_preflight = github_preflight!(deps)
+    local_socket_preflight = local_socket_preflight!(deps)
 
     preflight = linear_preflight!(deps, team_name, project_id, project_slug, project_name, lanes)
     shell(deps).info("Phase 3.6 preflight passed; live mutation gates are satisfied.")
@@ -344,7 +348,9 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "safety_gates" => safety_gate_summary(),
       "preflight" => %{
         "github" => "passed",
+        "github_checks" => github_preflight,
         "linear" => "passed",
+        "mix_pubsub_local_socket" => local_socket_preflight,
         "team" => %{
           "id" => preflight.team["id"],
           "key" => preflight.team["key"],
@@ -562,6 +568,44 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     end
   end
 
+  defp github_preflight!(deps) do
+    case deps.github_preflight.() do
+      :ok ->
+        %{"status" => "passed"}
+
+      {:ok, payload} when is_map(payload) ->
+        Map.put_new(stringify_keys(payload), "status", "passed")
+
+      {:error, reason} ->
+        Mix.raise("GitHub harness preflight failed before issue creation: #{inspect(reason)}")
+
+      payload when is_map(payload) ->
+        Map.put_new(stringify_keys(payload), "status", "passed")
+
+      other ->
+        Mix.raise("GitHub harness preflight returned unexpected payload before issue creation: #{inspect(other)}")
+    end
+  end
+
+  defp local_socket_preflight!(deps) do
+    case deps.local_socket_preflight.() do
+      :ok ->
+        %{"status" => "passed"}
+
+      {:ok, payload} when is_map(payload) ->
+        Map.put_new(stringify_keys(payload), "status", "passed")
+
+      {:error, reason} ->
+        Mix.raise("Mix PubSub/local socket preflight failed before issue creation: #{inspect(reason)}")
+
+      payload when is_map(payload) ->
+        Map.put_new(stringify_keys(payload), "status", "passed")
+
+      other ->
+        Mix.raise("Mix PubSub/local socket preflight returned unexpected payload before issue creation: #{inspect(other)}")
+    end
+  end
+
   defp linear_preflight!(deps, team_name, project_id, project_slug, project_name, lanes) do
     viewer = graphql_data!(deps, @viewer_query, %{}, "viewer")
     team = fetch_single!(graphql_data!(deps, @team_query, %{name: team_name}, "teams"), "teams", team_name)
@@ -603,19 +647,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     classification = LaneClassifier.classify(issue)
     issue = %{issue | lane_classification: classification}
 
-    runner_result =
-      try do
-        deps.run_agent.(issue, preflight, output_path)
-      rescue
-        error ->
-          {:error, {error, __STACKTRACE__}}
-      catch
-        kind, reason ->
-          {:error, {kind, reason}}
-      end
+    runner_result = supervised_run_agent(lane, issue, preflight, output_path, deps)
 
     snapshot = fetch_issue_snapshot(issue.id, deps)
-    evidence = evidence_for_lane(lane, issue, classification, runner_result, snapshot)
+    evidence = evidence_for_lane(lane, issue, classification, runner_result, snapshot, deps)
 
     if Atom.to_string(classification.lane) != lane do
       put_in(evidence, ["protocol_warnings"], [
@@ -628,6 +663,235 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       ])
     else
       evidence
+    end
+  end
+
+  defp supervised_run_agent(lane, issue, preflight, output_path, deps) do
+    timeout_ms = lane_runtime_ms(deps)
+    heartbeat_interval_ms = heartbeat_interval_ms(deps)
+    started_at = timestamp(deps)
+    started_monotonic_ms = deps.monotonic_time.()
+
+    task =
+      Task.async(fn ->
+        try do
+          deps.run_agent.(issue, preflight, output_path)
+        rescue
+          error ->
+            {:error, {error, __STACKTRACE__}}
+        catch
+          kind, reason ->
+            {:error, {kind, reason}}
+        end
+      end)
+
+    supervision = %{
+      "status" => "running",
+      "max_lane_runtime_ms" => timeout_ms,
+      "heartbeat_interval_ms" => heartbeat_interval_ms,
+      "started_at" => started_at,
+      "last_heartbeat_at" => started_at,
+      "last_output_at" => nil,
+      "workspace_path" => nil,
+      "codex_session_id" => nil,
+      "codex_process_id" => nil,
+      "heartbeat_count" => 0
+    }
+
+    wait_for_lane(task, lane, issue, deps, started_monotonic_ms, supervision)
+  end
+
+  defp wait_for_lane(task, lane, issue, deps, started_monotonic_ms, supervision) do
+    timeout_ms = supervision["max_lane_runtime_ms"]
+    heartbeat_interval_ms = supervision["heartbeat_interval_ms"]
+    elapsed_ms = deps.monotonic_time.() - started_monotonic_ms
+    remaining_ms = max(timeout_ms - elapsed_ms, 0)
+
+    cond do
+      remaining_ms <= 0 ->
+        timeout_lane(task, lane, issue, deps, started_monotonic_ms, supervision)
+
+      true ->
+        wait_ms = min(heartbeat_interval_ms, remaining_ms)
+
+        receive do
+          {ref, result} when ref == task.ref ->
+            Process.demonitor(task.ref, [:flush])
+            completed_supervision = completed_supervision(result, deps, started_monotonic_ms, supervision)
+            attach_supervision(result, completed_supervision)
+
+          {:DOWN, ref, :process, _pid, reason} when ref == task.ref ->
+            failed_supervision =
+              supervision
+              |> Map.put("status", "error")
+              |> Map.put("finished_at", timestamp(deps))
+              |> Map.put("elapsed_ms", deps.monotonic_time.() - started_monotonic_ms)
+              |> Map.put("error", inspect(reason))
+
+            {:error, {:lane_runner_exited, reason}, %{"supervision" => failed_supervision}}
+        after
+          wait_ms ->
+            next_supervision =
+              supervision
+              |> Map.put("last_heartbeat_at", timestamp(deps))
+              |> Map.update!("heartbeat_count", &(&1 + 1))
+
+            shell(deps).info("Phase 3.6 lane heartbeat lane=#{lane} issue=#{issue.identifier} elapsed_ms=#{elapsed_ms + wait_ms}")
+            wait_for_lane(task, lane, issue, deps, started_monotonic_ms, next_supervision)
+        end
+    end
+  end
+
+  defp completed_supervision(result, deps, started_monotonic_ms, supervision) do
+    telemetry = telemetry_from_runner_result(result)
+
+    supervision
+    |> Map.put("status", runner_result_status(result))
+    |> Map.put("finished_at", timestamp(deps))
+    |> Map.put("elapsed_ms", deps.monotonic_time.() - started_monotonic_ms)
+    |> Map.put("last_output_at", Map.get(telemetry, "last_output_at") || timestamp(deps))
+    |> Map.put("workspace_path", Map.get(telemetry, "workspace_path"))
+    |> Map.put("codex_session_id", Map.get(telemetry, "session_id"))
+    |> Map.put("codex_process_id", Map.get(telemetry, "codex_app_server_pid"))
+  end
+
+  defp timeout_lane(task, lane, issue, deps, started_monotonic_ms, supervision) do
+    Task.shutdown(task, :brutal_kill)
+
+    workspace_path = timeout_workspace_path(issue, deps)
+    diagnostics = timeout_diagnostics(lane, issue, workspace_path, deps)
+
+    timeout_supervision =
+      supervision
+      |> Map.put("status", "timeout")
+      |> Map.put("finished_at", timestamp(deps))
+      |> Map.put("elapsed_ms", deps.monotonic_time.() - started_monotonic_ms)
+      |> Map.put("last_output_at", Map.get(diagnostics, "last_output_at"))
+      |> Map.put("workspace_path", workspace_path)
+      |> Map.put("timeout_diagnostics", diagnostics)
+
+    {:timeout,
+     %{
+       "workspace_path" => workspace_path,
+       "changed_files" => get_in(diagnostics, ["git", "changed_files"]) || [],
+       "budget_state" => "timeout",
+       "supervision" => timeout_supervision,
+       "timeout_diagnostics" => diagnostics
+     }}
+  end
+
+  defp attach_supervision({:ok, telemetry}, supervision) when is_map(telemetry) do
+    {:ok, Map.put(telemetry, "supervision", supervision)}
+  end
+
+  defp attach_supervision({:error, reason}, supervision), do: {:error, reason, %{"supervision" => supervision}}
+  defp attach_supervision({:error, reason, telemetry}, supervision) when is_map(telemetry), do: {:error, reason, Map.put(telemetry, "supervision", supervision)}
+  defp attach_supervision({:timeout, telemetry}, supervision) when is_map(telemetry), do: {:timeout, Map.put(telemetry, "supervision", supervision)}
+  defp attach_supervision(other, supervision), do: {:error, {:unexpected_runner_result, other}, %{"supervision" => supervision}}
+
+  defp lane_runtime_ms(deps), do: positive_integer_setting(deps, :lane_runtime_ms, @default_lane_runtime_ms)
+  defp heartbeat_interval_ms(deps), do: max(positive_integer_setting(deps, :heartbeat_interval_ms, @default_heartbeat_interval_ms), 1)
+
+  defp positive_integer_setting(deps, key, default) do
+    value = Map.get(deps, key, default)
+    value = if is_function(value, 0), do: value.(), else: value
+
+    case value do
+      integer when is_integer(integer) and integer >= 0 -> integer
+      string when is_binary(string) -> parse_positive_integer(string, default)
+      _ -> default
+    end
+  end
+
+  defp parse_positive_integer(value, default) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer >= 0 -> integer
+      _ -> default
+    end
+  end
+
+  defp timeout_workspace_path(issue, deps) do
+    case deps.workspace_path_for_issue.(issue) do
+      path when is_binary(path) and path != "" -> path
+      _ -> nil
+    end
+  end
+
+  defp timeout_diagnostics(lane, issue, workspace_path, deps) do
+    git = deps.inspect_workspace_git.(workspace_path)
+    artifact = inspect_handoff_artifact(workspace_path)
+    linear_before_block = fetch_issue_snapshot(issue.id, deps)
+
+    github_artifact = %{
+      "branch_name" => Map.get(git, "branch_name") || issue.branch_name,
+      "commit_sha" => Map.get(git, "commit_sha"),
+      "pr_url" => nil,
+      "changed_files" => Map.get(git, "changed_files") || []
+    }
+
+    github =
+      github_verification_payload(
+        github_artifact,
+        %{lane: lane, issue: issue, workspace_path: workspace_path, repo_changed: true, changed_files: github_artifact["changed_files"]},
+        deps
+      )
+
+    block_result = block_timeout_issue(issue, deps)
+    linear_after_block = fetch_issue_snapshot(issue.id, deps)
+
+    %{
+      "reason" => "lane_runtime_timeout",
+      "workspace_path" => workspace_path,
+      "git" => git,
+      "artifact" => artifact,
+      "linear_before_block" => linear_before_block,
+      "linear_after_block" => linear_after_block,
+      "github" => github,
+      "blocked_transition" => block_result
+    }
+  end
+
+  defp inspect_handoff_artifact(workspace_path) do
+    artifact_path = handoff_artifact_path(workspace_path)
+
+    cond do
+      blank?(workspace_path) ->
+        %{"path" => artifact_path, "exists" => false, "status" => "workspace_unknown"}
+
+      not File.exists?(artifact_path) ->
+        %{"path" => artifact_path, "exists" => false}
+
+      true ->
+        case File.read(artifact_path) do
+          {:ok, body} ->
+            %{"path" => artifact_path, "exists" => true, "valid_json" => match?({:ok, %{}}, Jason.decode(body))}
+
+          {:error, reason} ->
+            %{"path" => artifact_path, "exists" => true, "read_error" => inspect(reason)}
+        end
+    end
+  end
+
+  defp block_timeout_issue(issue, deps) do
+    body = """
+    ## Symphony Handoff Blocked
+
+    Phase 3.6 live smoke timed out before handoff readiness could be verified.
+
+    Issue: #{issue.identifier || issue.id}
+    Reason: lane_runtime_timeout
+    """
+
+    handoff_result = deps.post_handoff_comment.(issue, body)
+
+    if handoff_result == :ok do
+      case deps.move_issue_to_state.(issue, Contract.current().blocked_state) do
+        :ok -> %{"status" => "blocked", "handoff_posted" => true}
+        {:error, reason} -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(reason)}
+        other -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(other)}
+      end
+    else
+      %{"status" => "handoff_failed", "handoff_posted" => false, "reason" => inspect(handoff_result)}
     end
   end
 
@@ -814,7 +1078,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     }
   end
 
-  defp evidence_for_lane(lane, issue, classification, runner_result, snapshot) do
+  defp evidence_for_lane(lane, issue, classification, runner_result, snapshot, deps) do
     telemetry = telemetry_from_runner_result(runner_result)
     artifact_result = handoff_artifact_result(lane, issue, classification, telemetry)
     comments = get_in(snapshot, ["comments", "nodes"]) || []
@@ -826,11 +1090,13 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     repo_changed = repo_changed?(artifact_repo_changed, observed_changed_files, pr_url)
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
     effective_changed_files = effective_changed_files(changed_files, observed_changed_files)
+    expected_final_state = expected_final_state(runner_result, final_state)
+    external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, effective_changed_files, expected_final_state, deps)
 
     gate_result =
       %{
         lane: lane,
-        current_state: final_state,
+        current_state: expected_final_state,
         available_states: issue.available_states,
         repo_changed: repo_changed,
         changed_files: effective_changed_files,
@@ -859,6 +1125,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "lane" => lane,
         "classification_reason" => classification.reason,
         "final_state" => final_state,
+        "expected_final_state" => expected_final_state,
         "pr_url" => pr_url,
         "branch_name" => artifact_value(artifact_result, ["branch_name"]) || Map.get(telemetry, "branch_name"),
         "commit_sha" => artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
@@ -883,18 +1150,37 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "handoff_artifact_path" => Map.get(artifact_result, "path"),
         "handoff_artifact_valid" => Map.get(artifact_result, "valid", false),
         "handoff_artifact_status" => artifact_value(artifact_result, ["status"]),
-        "external_verification" => Map.get(artifact_result, "verification_placeholders") || external_verification_placeholders(),
+        "external_verification" => Map.drop(external_verification, ["violations"]),
+        "runner_status" => runner_result_status(runner_result),
+        "supervision" => Map.get(telemetry, "supervision"),
+        "timeout_diagnostics" => Map.get(telemetry, "timeout_diagnostics"),
         "missing_evidence" => [],
         "code_seams_needed" => []
       }
 
     evidence
-    |> merge_artifact_findings(artifact_result)
+    |> merge_runner_findings(runner_result)
+    |> merge_artifact_findings(artifact_result, external_verification)
     |> record_missing_evidence()
   end
 
   defp telemetry_from_runner_result({:ok, telemetry}) when is_map(telemetry), do: telemetry
+  defp telemetry_from_runner_result({:error, _reason, telemetry}) when is_map(telemetry), do: telemetry
+  defp telemetry_from_runner_result({:timeout, telemetry}) when is_map(telemetry), do: telemetry
   defp telemetry_from_runner_result(_runner_result), do: %{}
+
+  defp runner_result_status({:ok, _telemetry}), do: "ok"
+  defp runner_result_status({:timeout, _telemetry}), do: "timeout"
+  defp runner_result_status({:error, _reason, _telemetry}), do: "error"
+  defp runner_result_status({:error, _reason}), do: "error"
+  defp runner_result_status(_runner_result), do: "error"
+
+  defp expected_final_state(runner_result, final_state) do
+    case runner_result_status(runner_result) do
+      status when status in ["timeout", "error"] -> Contract.current().blocked_state
+      _ -> final_state
+    end
+  end
 
   defp finalization_gate_result(run_state) do
     contract = Contract.current()
@@ -1042,8 +1328,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "artifact" => artifact,
       "valid" => violations == [],
       "violations" => violations,
-      "warnings" => [],
-      "verification_placeholders" => verify_external_handoff_artifacts(artifact, telemetry)
+      "warnings" => []
     }
   end
 
@@ -1121,31 +1406,144 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     )
   end
 
-  defp merge_artifact_findings(evidence, artifact_result) do
-    artifact_violations = Map.get(artifact_result, "violations", [])
-    artifact_warnings = Map.get(artifact_result, "warnings", [])
+  defp external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, changed_files, expected_final_state, deps) do
+    artifact = Map.get(artifact_result, "artifact") || %{}
 
-    evidence
-    |> Map.update!("protocol_violations", &(artifact_violations ++ &1))
-    |> Map.update!("protocol_warnings", &(artifact_warnings ++ artifact_verification_warnings() ++ &1))
-    |> Map.put("finalization_gate_result", if(artifact_violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
-  end
+    context = %{
+      lane: lane,
+      issue: issue,
+      telemetry: telemetry,
+      snapshot: snapshot,
+      repo_changed: repo_changed,
+      changed_files: changed_files,
+      expected_final_state: expected_final_state,
+      workspace_path: Map.get(telemetry, "workspace_path")
+    }
 
-  defp artifact_verification_warnings do
-    [
-      artifact_warning("github_artifact_verification_pending", "GitHub artifact verification hook is pending implementation."),
-      artifact_warning("linear_artifact_verification_pending", "Linear artifact verification hook is pending implementation.")
-    ]
-  end
+    github = github_verification_payload(artifact, context, deps)
+    linear = linear_verification_payload(issue, artifact, snapshot, context, deps)
+    violations = github_verification_violations(github, context) ++ linear_verification_violations(linear, context)
 
-  defp external_verification_placeholders do
     %{
-      "github" => %{"status" => "pending_hook"},
-      "linear" => %{"status" => "pending_hook"}
+      "github" => github,
+      "linear" => linear,
+      "valid" => violations == [],
+      "violations" => violations
     }
   end
 
-  defp verify_external_handoff_artifacts(_artifact, _telemetry), do: external_verification_placeholders()
+  defp github_verification_payload(artifact, context, deps) do
+    if truthy?(Map.get(context, :repo_changed)) do
+      case deps.github_verify.(artifact, context) do
+        {:ok, payload} when is_map(payload) -> stringify_keys(payload) |> Map.put_new("status", "completed")
+        {:error, reason} -> %{"status" => "error", "reason" => inspect(reason)}
+        payload when is_map(payload) -> stringify_keys(payload) |> Map.put_new("status", "completed")
+        other -> %{"status" => "error", "reason" => inspect(other)}
+      end
+    else
+      %{"status" => "skipped", "reason" => "repo_changed=false"}
+    end
+  end
+
+  defp linear_verification_payload(issue, artifact, snapshot, context, deps) do
+    case deps.linear_verify.(issue, artifact, snapshot, context) do
+      {:ok, payload} when is_map(payload) -> stringify_keys(payload) |> Map.put_new("status", "completed")
+      {:error, reason} -> %{"status" => "error", "reason" => inspect(reason)}
+      payload when is_map(payload) -> stringify_keys(payload) |> Map.put_new("status", "completed")
+      other -> %{"status" => "error", "reason" => inspect(other)}
+    end
+  end
+
+  defp github_verification_violations(%{"status" => "skipped"}, _context), do: []
+
+  defp github_verification_violations(%{"status" => "error", "reason" => reason}, _context) do
+    [artifact_violation("github_verification_failed", "GitHub external verification failed: #{reason}")]
+  end
+
+  defp github_verification_violations(verification, context) do
+    changed_files = Map.get(context, :changed_files) || []
+    external_changed_files = list_field(verification, "changed_files")
+    issue = Map.get(context, :issue)
+
+    []
+    |> maybe_add_violation(not truthy?(Map.get(verification, "branch_exists")), "github_branch_missing", "GitHub verification could not find the reported branch.")
+    |> maybe_add_violation(not truthy?(Map.get(verification, "commit_exists")), "github_commit_missing", "GitHub verification could not find the reported commit.")
+    |> maybe_add_violation(not truthy?(Map.get(verification, "pr_exists")), "github_pr_missing", "GitHub verification could not find the reported pull request.")
+    |> maybe_add_violation(
+      not truthy?(Map.get(verification, "pr_draft") || Map.get(verification, "is_draft") || Map.get(verification, "isDraft")),
+      "github_pr_not_draft",
+      "GitHub verification requires the pull request to be draft."
+    )
+    |> maybe_add_violation(
+      (Map.get(verification, "pr_base_ref") || Map.get(verification, "baseRefName")) != "main",
+      "github_pr_wrong_base",
+      "GitHub verification requires the pull request to target main."
+    )
+    |> maybe_add_violation(not pr_links_issue?(verification, issue), "github_pr_missing_linear_link", "GitHub verification requires the PR title/body to link the Linear issue.")
+    |> maybe_add_violation(
+      external_changed_files != [] and Enum.sort(external_changed_files) != Enum.sort(changed_files),
+      "github_changed_files_mismatch",
+      "GitHub PR changed files did not match the handoff artifact."
+    )
+    |> maybe_add_violation(
+      Map.get(context, :lane) == "docs" and FinalizationGate.code_bearing_changes?(external_changed_files),
+      "github_changed_files_lane_mismatch",
+      "Docs lane PR changed code-bearing files."
+    )
+  end
+
+  defp linear_verification_violations(%{"status" => "error", "reason" => reason}, _context) do
+    [artifact_violation("linear_verification_failed", "Linear external verification failed: #{reason}")]
+  end
+
+  defp linear_verification_violations(verification, context) do
+    expected_state = Map.get(context, :expected_final_state)
+    repo_changed = Map.get(context, :repo_changed)
+    lane = Map.get(context, :lane)
+
+    []
+    |> maybe_add_violation(Map.get(verification, "final_state") != expected_state, "linear_state_mismatch", "Linear issue final state did not match the expected Phase 3.6 result.")
+    |> maybe_add_violation(
+      expected_state == Contract.current().blocked_state and not truthy?(Map.get(verification, "blocker_comment_exists")),
+      "linear_blocker_comment_missing",
+      "Blocked Phase 3.6 lanes require a blocker handoff comment."
+    )
+    |> maybe_add_violation(
+      expected_state != Contract.current().blocked_state and not truthy?(Map.get(verification, "handoff_comment_exists")),
+      "linear_handoff_comment_missing",
+      "Human Review Phase 3.6 lanes require a handoff comment."
+    )
+    |> maybe_add_violation(repo_changed and not truthy?(Map.get(verification, "pr_url_posted")), "linear_pr_url_missing", "Repo-changing Phase 3.6 lanes require the PR URL to be posted to Linear.")
+    |> maybe_add_violation(
+      lane == "research" and not repo_changed and not truthy?(Map.get(verification, "research_findings_posted")),
+      "linear_research_findings_missing",
+      "Read-only research lanes require findings to be posted to Linear."
+    )
+  end
+
+  defp merge_runner_findings(evidence, runner_result) do
+    violations =
+      case runner_result_status(runner_result) do
+        "timeout" -> [artifact_violation("lane_runtime_timeout", "Phase 3.6 lane exceeded the supervised max runtime.")]
+        "error" -> [artifact_violation("lane_runner_failed", "Phase 3.6 lane runner exited before handoff verification completed.")]
+        _ -> []
+      end
+
+    evidence
+    |> Map.update!("protocol_violations", &(violations ++ &1))
+    |> Map.put("finalization_gate_result", if(violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
+  end
+
+  defp merge_artifact_findings(evidence, artifact_result, external_verification) do
+    artifact_violations = Map.get(artifact_result, "violations", [])
+    artifact_warnings = Map.get(artifact_result, "warnings", [])
+    external_violations = Map.get(external_verification, "violations", [])
+
+    evidence
+    |> Map.update!("protocol_violations", &(artifact_violations ++ external_violations ++ &1))
+    |> Map.update!("protocol_warnings", &(artifact_warnings ++ &1))
+    |> Map.put("finalization_gate_result", if(artifact_violations == [] and external_violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
+  end
 
   defp artifact_value(%{"artifact" => artifact}, path) when is_map(artifact), do: get_in(artifact, path)
   defp artifact_value(_artifact_result, _path), do: nil
@@ -1194,10 +1592,27 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp repo_changing_lane?(lane), do: lane in ["docs", "bug", "feature", "refactor", "test", "chore"]
 
   defp artifact_violation(code, message), do: %{"code" => code, "message" => message, "severity" => "error"}
-  defp artifact_warning(code, message), do: %{"code" => code, "message" => message, "severity" => "warning"}
 
   defp maybe_add_violation(violations, true, code, message), do: [artifact_violation(code, message) | violations]
   defp maybe_add_violation(violations, false, _code, _message), do: violations
+
+  defp list_field(map, key) do
+    case Map.get(map, key) || Map.get(map, String.to_atom(key)) do
+      values when is_list(values) -> Enum.map(values, &to_string/1)
+      _ -> []
+    end
+  end
+
+  defp pr_links_issue?(verification, %Issue{} = issue) do
+    title = Map.get(verification, "pr_title") || Map.get(verification, "title") || ""
+    body = Map.get(verification, "pr_body") || Map.get(verification, "body") || ""
+    text = title <> "\n" <> body
+    identifier = issue.identifier || issue.id || ""
+
+    String.contains?(text, identifier) and (blank?(issue.url) or String.contains?(text, issue.url))
+  end
+
+  defp pr_links_issue?(_verification, _issue), do: false
 
   defp fetch_issue!(issue_id, deps) do
     deps
@@ -1428,6 +1843,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     }
     |> Map.merge(token_usage(messages))
     |> Map.merge(workspace_git_telemetry(messages))
+    |> Map.merge(session_telemetry(messages))
   end
 
   defp count_tool_calls(messages) do
@@ -1529,6 +1945,20 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     end
   end
 
+  defp session_telemetry(messages) do
+    %{
+      "session_id" => messages |> Enum.find_value(&map_get(&1, :session_id)),
+      "codex_app_server_pid" => messages |> Enum.find_value(&map_get(&1, :codex_app_server_pid)),
+      "last_output_at" => messages |> Enum.map(&map_get(&1, :timestamp)) |> Enum.reject(&is_nil/1) |> List.last() |> normalize_timestamp()
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp normalize_timestamp(%DateTime{} = timestamp), do: timestamp |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+  defp normalize_timestamp(timestamp) when is_binary(timestamp), do: timestamp
+  defp normalize_timestamp(_timestamp), do: nil
+
   defp git(workspace, args) do
     case System.cmd("git", args, cd: workspace, stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)
@@ -1556,13 +1986,158 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   defp default_github_preflight do
     with :ok <- run_gh(["auth", "status"]),
-         {:ok, repo_payload} <- run_gh_json(["repo", "view", @repo, "--json", "nameWithOwner"]) do
+         {:ok, repo_payload} <- run_gh_json(["repo", "view", @repo, "--json", "nameWithOwner,viewerPermission,defaultBranchRef"]) do
       case repo_payload do
-        %{"nameWithOwner" => @repo} -> :ok
-        payload -> Mix.raise("GitHub repo preflight returned unexpected payload: #{inspect(payload)}")
+        %{"nameWithOwner" => @repo} ->
+          viewer_permission = Map.get(repo_payload, "viewerPermission")
+
+          if github_push_permission?(viewer_permission) do
+            {:ok,
+             %{
+               "auth_read" => "passed",
+               "repo" => @repo,
+               "viewer_permission" => viewer_permission,
+               "push_permission_check" => "passed",
+               "default_branch" => get_in(repo_payload, ["defaultBranchRef", "name"])
+             }}
+          else
+            Mix.raise("GitHub repo preflight did not confirm push permission for #{@repo}: #{inspect(viewer_permission)}")
+          end
+
+        payload ->
+          Mix.raise("GitHub repo preflight returned unexpected payload: #{inspect(payload)}")
       end
     end
   end
+
+  defp github_push_permission?(permission), do: permission in ["WRITE", "MAINTAIN", "ADMIN"]
+
+  defp default_local_socket_preflight do
+    case :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}]) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        {:ok, %{"socket" => "passed"}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp default_github_verify(artifact, context) do
+    branch_name = Map.get(artifact, "branch_name")
+    commit_sha = Map.get(artifact, "commit_sha")
+    pr_url = Map.get(artifact, "pr_url")
+    workspace_path = Map.get(context, :workspace_path)
+
+    with true <- is_binary(pr_url) and pr_url != "",
+         {:ok, pr_payload} <- run_gh_json_safe(["pr", "view", pr_url, "--json", "url,isDraft,baseRefName,title,body,headRefName,files,commits"]) do
+      {:ok,
+       %{
+         "status" => "completed",
+         "branch_exists" => github_branch_exists?(workspace_path, branch_name),
+         "commit_exists" => github_commit_exists?(commit_sha),
+         "pr_exists" => true,
+         "pr_draft" => Map.get(pr_payload, "isDraft"),
+         "pr_base_ref" => Map.get(pr_payload, "baseRefName"),
+         "pr_title" => Map.get(pr_payload, "title"),
+         "pr_body" => Map.get(pr_payload, "body"),
+         "pr_url" => Map.get(pr_payload, "url"),
+         "changed_files" => pr_changed_files(pr_payload)
+       }}
+    else
+      {:error, reason} ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "branch_exists" => github_branch_exists?(workspace_path, branch_name),
+           "commit_exists" => github_commit_exists?(commit_sha),
+           "pr_exists" => false,
+           "pr_lookup_error" => inspect(reason),
+           "changed_files" => []
+         }}
+
+      false ->
+        {:ok,
+         %{
+           "status" => "completed",
+           "branch_exists" => github_branch_exists?(workspace_path, branch_name),
+           "commit_exists" => github_commit_exists?(commit_sha),
+           "pr_exists" => false,
+           "pr_lookup_error" => "missing_pr_url",
+           "changed_files" => []
+         }}
+    end
+  end
+
+  defp github_branch_exists?(workspace_path, branch_name) when is_binary(workspace_path) and is_binary(branch_name) do
+    case git(workspace_path, ["ls-remote", "--heads", "origin", branch_name]) do
+      output when is_binary(output) -> String.trim(output) != ""
+      _ -> false
+    end
+  end
+
+  defp github_branch_exists?(_workspace_path, _branch_name), do: false
+
+  defp github_commit_exists?(commit_sha) when is_binary(commit_sha) and commit_sha != "" do
+    case run_gh(["api", "repos/#{@repo}/commits/#{commit_sha}"]) do
+      :ok -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp github_commit_exists?(_commit_sha), do: false
+
+  defp pr_changed_files(%{"files" => files}) when is_list(files) do
+    files
+    |> Enum.map(fn
+      %{"path" => path} -> path
+      %{path: path} -> path
+      _ -> nil
+    end)
+    |> Enum.reject(&blank?/1)
+  end
+
+  defp pr_changed_files(_payload), do: []
+
+  defp default_linear_verify(_issue, artifact, snapshot, context) do
+    comments = get_in(snapshot, ["comments", "nodes"]) || []
+    pr_url = Map.get(artifact, "pr_url")
+    expected_state = Map.get(context, :expected_final_state)
+    repo_changed = Map.get(context, :repo_changed)
+    lane = Map.get(context, :lane)
+
+    {:ok,
+     %{
+       "status" => "completed",
+       "final_state" => get_in(snapshot, ["state", "name"]),
+       "expected_final_state" => expected_state,
+       "handoff_comment_exists" => handoff_comment(comments) != nil,
+       "blocker_comment_exists" => blocker_comment(comments) != nil,
+       "pr_url_posted" => not repo_changed or comment_body_contains(comments, pr_url),
+       "research_findings_posted" => lane != "research" or repo_changed or handoff_comment(comments) != nil
+     }}
+  end
+
+  defp default_inspect_workspace_git(workspace_path) when is_binary(workspace_path) do
+    %{
+      "workspace_path" => workspace_path,
+      "status" => git(workspace_path, ["status", "--short"]),
+      "branch_name" => git(workspace_path, ["branch", "--show-current"]),
+      "commit_sha" => git(workspace_path, ["rev-parse", "HEAD"]),
+      "changed_files" => git_lines(workspace_path, ["diff", "--name-only", "origin/main...HEAD"])
+    }
+  end
+
+  defp default_inspect_workspace_git(_workspace_path), do: %{"status" => "workspace_unknown", "changed_files" => []}
+
+  defp default_workspace_path_for_issue(%Issue{identifier: identifier}) when is_binary(identifier) do
+    safe_identifier = String.replace(identifier, ~r/[^a-zA-Z0-9._-]/, "_")
+    Path.join(Config.settings!().workspace.root, safe_identifier)
+  end
+
+  defp default_workspace_path_for_issue(_issue), do: nil
 
   defp run_gh(args) do
     case System.cmd("gh", args, stderr_to_stdout: true) do
@@ -1575,6 +2150,13 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     case System.cmd("gh", args, stderr_to_stdout: true) do
       {output, 0} -> Jason.decode(output)
       {output, status} -> Mix.raise("gh #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
+  end
+
+  defp run_gh_json_safe(args) do
+    case System.cmd("gh", args, stderr_to_stdout: true) do
+      {output, 0} -> Jason.decode(output)
+      {output, status} -> {:error, {status, output}}
     end
   end
 
@@ -1597,13 +2179,35 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     %{
       getenv: &System.get_env/1,
       github_preflight: &default_github_preflight/0,
+      local_socket_preflight: &default_local_socket_preflight/0,
       linear_graphql: &default_linear_graphql/2,
+      github_verify: &default_github_verify/2,
+      linear_verify: &default_linear_verify/4,
+      inspect_workspace_git: &default_inspect_workspace_git/1,
+      workspace_path_for_issue: &default_workspace_path_for_issue/1,
       move_issue_to_state: &Tracker.move_issue_to_state/2,
+      post_handoff_comment: &Tracker.post_handoff_comment/2,
       run_agent: &default_run_agent/3,
       write_file: &File.write!/2,
+      lane_runtime_ms: fn -> env_integer("PHASE36_LANE_TIMEOUT_MS", @default_lane_runtime_ms) end,
+      heartbeat_interval_ms: fn -> env_integer("PHASE36_HEARTBEAT_INTERVAL_MS", @default_heartbeat_interval_ms) end,
+      monotonic_time: fn -> System.monotonic_time(:millisecond) end,
       now: &DateTime.utc_now/0,
       shell: Mix.shell()
     }
+  end
+
+  defp env_integer(name, default) do
+    case System.get_env(name) do
+      nil -> default
+      value -> parse_positive_integer(value, default)
+    end
+  end
+
+  defp timestamp(deps) do
+    deps.now.()
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
   end
 
   defp safety_gate_summary do
@@ -1612,7 +2216,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "CONFIRM_LIVE_SMOKE_MUTATION" => "must equal true",
       "LINEAR_API_KEY" => "must be present",
       "GH_TOKEN_or_GITHUB_TOKEN" => "one must be present",
-      "github_preflight" => "gh auth status and repo view must pass",
+      "github_preflight" => "gh auth status, repo view, and non-mutating push permission check must pass",
+      "mix_pubsub_local_socket_preflight" => "local socket creation must pass under the command environment",
       "linear_preflight" => "viewer and exact Agent Workbench statuses must pass"
     }
   end
@@ -1635,6 +2240,22 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     Enum.find(comments, fn comment ->
       body = comment["body"] || ""
       String.contains?(body, "Symphony Handoff") or String.contains?(body, "Draft PR:")
+    end)
+  end
+
+  defp blocker_comment(comments) do
+    Enum.find(comments, fn comment ->
+      body = comment["body"] || ""
+      String.contains?(body, "Symphony Handoff Blocked") or String.contains?(String.downcase(body), "blocker")
+    end)
+  end
+
+  defp comment_body_contains(_comments, value) when not is_binary(value) or value == "", do: false
+
+  defp comment_body_contains(comments, value) do
+    Enum.any?(comments, fn comment ->
+      body = comment["body"] || ""
+      String.contains?(body, value)
     end)
   end
 

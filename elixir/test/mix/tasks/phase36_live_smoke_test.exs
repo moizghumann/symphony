@@ -68,6 +68,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           _ -> nil
         end,
         github_preflight: fn -> flunk("github preflight should not run") end,
+        local_socket_preflight: fn -> flunk("local socket preflight should not run") end,
         linear_graphql: fn _query, _variables -> flunk("linear preflight should not run") end
       })
 
@@ -79,6 +80,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
       inert_deps(%{
         getenv: selector_env("docs,docs"),
         github_preflight: fn -> flunk("github preflight should not run") end,
+        local_socket_preflight: fn -> flunk("local socket preflight should not run") end,
         linear_graphql: fn _query, _variables -> flunk("linear preflight should not run") end
       })
 
@@ -101,6 +103,23 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert {:error, diff} = LiveSmoke.validate_agent_workbench_statuses(invalid_states)
     assert diff.missing == ["Canceled"]
     assert diff.unexpected == ["Cancelled"]
+  end
+
+  test "aborts before issue creation when Mix PubSub local socket preflight fails" do
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        local_socket_preflight: fn -> {:error, :eperm} end,
+        linear_graphql: fn query, _variables ->
+          refute String.contains?(query, "Phase36LiveSmokeCreateIssue")
+          flunk("Linear preflight should not run after local socket failure")
+        end
+      })
+
+    assert_raise Mix.Error, ~r/Mix PubSub\/local socket preflight failed before issue creation: :eperm/, fn ->
+      LiveSmoke.run_with_deps(["--output", temp_output_path()], deps)
+    end
   end
 
   test "prints plan before refusing missing mutation confirmation" do
@@ -376,6 +395,124 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     File.rm(output_path)
   end
 
+  test "timeout creates failure evidence and blocks the lane" do
+    output_path = temp_output_path()
+    workspace_path = temp_workspace_path()
+    File.mkdir_p!(workspace_path)
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        lane_runtime_ms: 1,
+        heartbeat_interval_ms: 1,
+        workspace_path_for_issue: fn _issue -> workspace_path end,
+        inspect_workspace_git: fn ^workspace_path ->
+          %{
+            "workspace_path" => workspace_path,
+            "status" => " M docs/validation/phase-3-6-orchestration-validation.md",
+            "branch_name" => "agent/docs-timeout",
+            "commit_sha" => "0123456789abcdef0123456789abcdef01234567",
+            "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]
+          }
+        end,
+        run_agent: fn _issue, _preflight, _output_path ->
+          receive do
+          after
+            5_000 -> {:ok, %{}}
+          end
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["runner_status"] == "timeout"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert get_in(lane_result, ["supervision", "status"]) == "timeout"
+    assert get_in(lane_result, ["timeout_diagnostics", "git", "status"]) =~ "docs/validation"
+    assert get_in(lane_result, ["timeout_diagnostics", "blocked_transition", "status"]) == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_runtime_timeout"))
+
+    File.rm(output_path)
+  end
+
+  test "fails when GitHub PR verification does not match the artifact" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        github_verify: fn _artifact, _context ->
+          {:ok,
+           %{
+             "branch_exists" => true,
+             "commit_exists" => true,
+             "pr_exists" => true,
+             "pr_draft" => false,
+             "pr_base_ref" => "develop",
+             "pr_title" => "missing issue link",
+             "pr_body" => "missing issue link",
+             "changed_files" => ["lib/symphony_elixir/agent_runner.ex"]
+           }}
+        end,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue)}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "github_pr_not_draft"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "github_pr_wrong_base"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "github_changed_files_mismatch"))
+
+    File.rm(output_path)
+  end
+
+  test "fails when Linear final state verification does not match" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        linear_verify: fn _issue, _artifact, _snapshot, _context ->
+          {:ok,
+           %{
+             "final_state" => "In Progress",
+             "handoff_comment_exists" => true,
+             "blocker_comment_exists" => false,
+             "pr_url_posted" => true,
+             "research_findings_posted" => true
+           }}
+        end,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue)}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "linear_state_mismatch"))
+
+    File.rm(output_path)
+  end
+
   test "fails repo-changing artifact without pr evidence" do
     output_path = temp_output_path()
 
@@ -401,6 +538,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     [lane_result] = evidence["results"]
     assert lane_result["finalization_gate_result"] == "blocked"
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "repo_change_artifact_missing_git_fields"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "github_pr_missing"))
 
     File.rm(output_path)
   end
@@ -530,13 +668,25 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           _ -> nil
         end,
         github_preflight: fn -> flunk("github preflight should not run") end,
+        local_socket_preflight: fn -> :ok end,
         linear_graphql: fn _query, _variables -> flunk("linear preflight should not run") end,
+        github_verify: &valid_github_verification/2,
+        linear_verify: &valid_linear_verification/4,
+        inspect_workspace_git: &fake_workspace_git/1,
+        workspace_path_for_issue: fn _issue -> nil end,
         move_issue_to_state: fn _issue, state ->
           Process.put({__MODULE__, :phase36_issue_state}, state_payload(state))
           :ok
         end,
+        post_handoff_comment: fn _issue, body ->
+          Process.put({__MODULE__, :phase36_issue_comments}, [%{"id" => "comment-blocker", "url" => "https://linear.app/comment/blocker", "body" => body}])
+          :ok
+        end,
         run_agent: fn _issue, _preflight, _output_path -> flunk("agent should not run") end,
         write_file: fn _path, _body -> :ok end,
+        lane_runtime_ms: 60_000,
+        heartbeat_interval_ms: 1_000,
+        monotonic_time: fn -> System.monotonic_time(:millisecond) end,
         now: fn -> ~U[2026-05-11 00:00:00Z] end,
         shell: Mix.shell()
       },
@@ -610,6 +760,47 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
   defp temp_workspace_path do
     Path.join(System.tmp_dir!(), "phase36-live-smoke-workspace-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}")
+  end
+
+  defp valid_github_verification(artifact, context) do
+    issue = Map.fetch!(context, :issue)
+    pr_url = Map.get(artifact, "pr_url")
+
+    {:ok,
+     %{
+       "branch_exists" => not is_nil(Map.get(artifact, "branch_name")),
+       "commit_exists" => not is_nil(Map.get(artifact, "commit_sha")),
+       "pr_exists" => is_binary(pr_url) and pr_url != "",
+       "pr_draft" => true,
+       "pr_base_ref" => "main",
+       "pr_title" => "#{issue.identifier}: #{issue.title}",
+       "pr_body" => "Linear issue: #{issue.url}",
+       "changed_files" => Map.get(context, :changed_files) || []
+     }}
+  end
+
+  defp valid_linear_verification(_issue, _artifact, _snapshot, context) do
+    expected_state = Map.fetch!(context, :expected_final_state)
+    blocked? = expected_state == "Blocked"
+
+    {:ok,
+     %{
+       "final_state" => expected_state,
+       "handoff_comment_exists" => not blocked?,
+       "blocker_comment_exists" => blocked?,
+       "pr_url_posted" => true,
+       "research_findings_posted" => true
+     }}
+  end
+
+  defp fake_workspace_git(workspace_path) do
+    %{
+      "workspace_path" => workspace_path,
+      "status" => "",
+      "branch_name" => nil,
+      "commit_sha" => nil,
+      "changed_files" => []
+    }
   end
 
   defp default_handoff_artifact(issue) do
