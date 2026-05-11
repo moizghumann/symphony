@@ -10,15 +10,49 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     :ok
   end
 
-  test "supports only docs, one of test or bug, and research" do
-    assert LiveSmoke.supported_lane_names() == ["docs", "test", "bug", "research"]
-    refute "feature" in LiveSmoke.supported_lane_names()
-    refute "refactor" in LiveSmoke.supported_lane_names()
-    refute "chore" in LiveSmoke.supported_lane_names()
+  test "supports all seven Phase 3.6 lanes and refuses unknown lanes" do
+    assert LiveSmoke.supported_lane_names() == ["docs", "bug", "feature", "refactor", "test", "chore", "research"]
 
-    assert_raise Mix.Error, ~r/Unsupported Phase 3.6 live-smoke lane "feature"/, fn ->
-      LiveSmoke.run_with_deps(["--lane", "docs", "--lane", "feature", "--lane", "research"], inert_deps())
+    assert_raise Mix.Error, ~r/Unsupported Phase 3.6 live-smoke lane "unknown"/, fn ->
+      LiveSmoke.run_with_deps(["--lane", "unknown"], inert_deps())
     end
+  end
+
+  test "runs exactly selected lanes from PHASE36_SMOKE_LANES" do
+    output_path = Path.join(System.tmp_dir!(), "phase36-live-smoke-test-#{System.unique_integer([:positive])}.json")
+
+    deps =
+      inert_deps(%{
+        getenv: fn
+          "RUN_REAL_SMOKE" -> "true"
+          "CONFIRM_LIVE_SMOKE_MUTATION" -> "true"
+          "LINEAR_API_KEY" -> "linear-token"
+          "GH_TOKEN" -> "gh-token"
+          "GITHUB_TOKEN" -> nil
+          "PHASE36_SMOKE_LANES" -> "bug,feature,refactor,chore"
+          _ -> nil
+        end,
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          {:ok,
+           %{
+             "tool_call_count" => 1,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 1,
+             "budget_state" => "ok"
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    assert evidence["requested_lanes"] == ["bug", "feature", "refactor", "chore"]
+    assert Enum.map(evidence["results"], & &1["lane"]) == ["bug", "feature", "refactor", "chore"]
+
+    File.rm(output_path)
   end
 
   test "requires exactly Canceled spelling in Agent Workbench statuses" do
@@ -46,6 +80,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           "LINEAR_API_KEY" -> "linear-token"
           "GH_TOKEN" -> "gh-token"
           "GITHUB_TOKEN" -> nil
+          _ -> nil
         end
       })
 
@@ -93,6 +128,13 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     File.rm(output_path)
   end
 
+  test "generated live workflow grants git metadata writes to the managed workspace" do
+    workflow = LiveSmoke.live_workflow_for_test("c7cc9de0cbf2", System.tmp_dir!())
+    assert workflow =~ "writableRoots:"
+    assert workflow =~ ".git"
+    assert workflow =~ "networkAccess: true"
+  end
+
   defp inert_deps(overrides \\ %{}) do
     Map.merge(
       %{
@@ -102,9 +144,11 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
           "LINEAR_API_KEY" -> "linear-token"
           "GH_TOKEN" -> "gh-token"
           "GITHUB_TOKEN" -> nil
+          _ -> nil
         end,
         github_preflight: fn -> flunk("github preflight should not run") end,
         linear_graphql: fn _query, _variables -> flunk("linear preflight should not run") end,
+        move_issue_to_state: fn _issue, _state -> :ok end,
         run_agent: fn _issue, _preflight, _output_path -> flunk("agent should not run") end,
         write_file: fn _path, _body -> :ok end,
         now: fn -> ~U[2026-05-11 00:00:00Z] end,

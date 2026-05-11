@@ -425,6 +425,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
 
+        if String.trim(payload_string) != "" do
+          emit_message(
+            on_message,
+            :stream_output,
+            %{
+              payload: payload_string,
+              raw: payload_string
+            },
+            metadata_from_message(port, %{raw: payload_string})
+          )
+        end
+
         if protocol_message_candidate?(payload_string) do
           emit_message(
             on_message,

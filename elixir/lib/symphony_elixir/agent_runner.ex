@@ -127,7 +127,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_after_turn(issue, app_session, turn_context, turn_number, max_turns, handoff_ready) do
     if handoff_ready do
-      complete_handoff(turn_context.workspace, issue, turn_context.worker_host, turn_context.codex_update_recipient)
+      complete_handoff(turn_context.workspace, issue, turn_context.worker_host, turn_context.codex_update_recipient, turn_context.opts)
     else
       continue_after_unfinished_turn(issue, app_session, turn_context, turn_number, max_turns)
     end
@@ -163,8 +163,12 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp complete_handoff(workspace, issue, worker_host, codex_update_recipient) do
-    case GitHubHandoff.complete(workspace, issue, worker_host, lifecycle_recorder: lifecycle_recorder(codex_update_recipient, issue)) do
+  defp complete_handoff(workspace, issue, worker_host, codex_update_recipient, opts) do
+    handoff_opts =
+      opts
+      |> Keyword.put(:lifecycle_recorder, lifecycle_recorder(codex_update_recipient, issue))
+
+    case GitHubHandoff.complete(workspace, issue, worker_host, handoff_opts) do
       {:ok, pr_url} ->
         Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
         :ok

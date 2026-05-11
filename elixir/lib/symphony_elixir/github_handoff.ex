@@ -22,10 +22,10 @@ defmodule SymphonyElixir.GitHubHandoff do
     with :ok <- ensure_git_repo(workspace, worker_host),
          {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host),
          true <- artifacts.repo_changed,
-         {:ok, branch} <- ensure_branch(workspace, issue, worker_host),
-         :ok <- ensure_committed(workspace, worker_host),
+         {:ok, branch} <- ensure_branch(workspace, issue, worker_host, opts),
+         :ok <- ensure_committed(workspace, worker_host, issue, opts),
          {:ok, commit_sha} <- head_sha(workspace, worker_host),
-         :ok <- ensure_pushed(workspace, branch, worker_host),
+         :ok <- ensure_pushed(workspace, branch, worker_host, opts),
          {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url, opts),
          :ok <-
@@ -107,7 +107,13 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp changed_files(workspace, worker_host) do
     case run(workspace, "git", ["diff", "--name-only", "origin/main...HEAD"], worker_host) do
       {:ok, output} ->
-        {:ok, parse_changed_files(output)}
+        changed_files = parse_changed_files(output)
+
+        if changed_files == [] do
+          changed_files_from_status(workspace, worker_host)
+        else
+          {:ok, changed_files}
+        end
 
       {:error, _reason} ->
         changed_files_from_status(workspace, worker_host)
@@ -140,10 +146,14 @@ defmodule SymphonyElixir.GitHubHandoff do
     |> Enum.uniq()
   end
 
-  defp ensure_branch(workspace, %Issue{} = issue, worker_host) do
+  defp ensure_branch(workspace, %Issue{} = issue, worker_host, opts) do
     with {:ok, branch} <- current_branch(workspace, worker_host) do
       if branch in ["", "main", "master"] do
-        {:error, {:git_branch_failed, {:invalid_handoff_branch, branch, issue_branch_name(issue)}}}
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          switch_branch(workspace, issue_branch_name(issue), worker_host)
+        else
+          {:error, {:git_branch_failed, {:invalid_handoff_branch, branch, issue_branch_name(issue)}}}
+        end
       else
         {:ok, branch}
       end
@@ -157,9 +167,23 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
+  defp switch_branch(workspace, branch, worker_host) do
+    case run(workspace, "git", ["switch", "-c", branch], worker_host) do
+      {:ok, _output} -> {:ok, branch}
+      {:error, reason} -> {:error, {:git_branch_failed, reason}}
+    end
+  end
+
   defp head_sha(workspace, worker_host) do
     case run(workspace, "git", ["rev-parse", "HEAD"], worker_host) do
       {:ok, output} -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, {:git_commit_failed, reason}}
+    end
+  end
+
+  defp commit_changes(workspace, %Issue{} = issue, worker_host) do
+    case run(workspace, "git", ["commit", "-m", commit_message(issue)], worker_host) do
+      {:ok, _output} -> :ok
       {:error, reason} -> {:error, {:git_commit_failed, reason}}
     end
   end
@@ -177,13 +201,20 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp issue_branch_name(_issue), do: "symphony/issue"
 
-  defp ensure_committed(workspace, worker_host) do
+  defp ensure_committed(workspace, worker_host, issue, opts) do
     case run(workspace, "git", ["status", "--porcelain"], worker_host) do
       {:ok, output} ->
         if String.trim(output) == "" do
           :ok
         else
-          {:error, {:git_commit_failed, {:uncommitted_changes, output}}}
+          if Keyword.get(opts, :auto_publish_from_main, false) do
+            with :ok <- run(workspace, "git", ["add", "-A"], worker_host),
+                 :ok <- commit_changes(workspace, issue, worker_host) do
+              :ok
+            end
+          else
+            {:error, {:git_commit_failed, {:uncommitted_changes, output}}}
+          end
         end
 
       {:error, reason} ->
@@ -191,7 +222,7 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp ensure_pushed(workspace, branch, worker_host) when is_binary(branch) do
+  defp ensure_pushed(workspace, branch, worker_host, opts) when is_binary(branch) do
     with {:ok, head_sha} <- run(workspace, "git", ["rev-parse", "HEAD"], worker_host),
          {:ok, remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", branch], worker_host) do
       local_sha = String.trim(head_sha)
@@ -199,7 +230,14 @@ defmodule SymphonyElixir.GitHubHandoff do
       if remote_contains_sha?(remote_output, local_sha) do
         :ok
       else
-        {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          case run(workspace, "git", ["push", "-u", "origin", branch], worker_host) do
+            {:ok, _output} -> :ok
+            {:error, reason} -> {:error, {:git_push_failed, reason}}
+          end
+        else
+          {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
+        end
       end
     else
       {:error, reason} -> {:error, {:git_push_failed, reason}}

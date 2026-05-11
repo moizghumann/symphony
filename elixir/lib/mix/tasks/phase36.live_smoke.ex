@@ -3,11 +3,13 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   alias SymphonyElixir.AgentRunner
   alias SymphonyElixir.LaneClassifier
+  alias SymphonyElixir.LanePolicy
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Protocol.{Contract, FinalizationGate}
+  alias SymphonyElixir.Tracker
   alias SymphonyElixir.Workflow
 
-  @shortdoc "Run guarded Phase 3.6 live smoke for docs, test/bug, and research"
+  @shortdoc "Run guarded Phase 3.6 live smoke lanes"
 
   @moduledoc """
   Runs the guarded Phase 3.6 live smoke harness.
@@ -17,17 +19,19 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
       RUN_REAL_SMOKE=true CONFIRM_LIVE_SMOKE_MUTATION=true mix phase36.live_smoke
 
-  Supported lanes are `docs`, exactly one of `test` or `bug`, and `research`.
-  Feature, refactor, and chore are intentionally unsupported.
+  By default this runs `docs`, `test`, and `research`.
+
+  Select lanes with repeated `--lane` options or a comma-separated
+  `PHASE36_SMOKE_LANES` value.
   """
 
   @requirements ["app.start"]
 
   @repo "moizghumann/symphony"
   @default_team_name "Agent Workbench"
-  @default_project_name "Symphony Agent Queue"
+  @default_project_name "`Symphony Agent Queue`"
   @default_lanes ["docs", "test", "research"]
-  @supported_lanes ["docs", "test", "bug", "research"]
+  @supported_lanes ["docs", "bug", "feature", "refactor", "test", "chore", "research"]
   @expected_status_names [
     "Backlog",
     "Todo",
@@ -226,6 +230,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   def expected_status_names, do: @expected_status_names
 
   @doc false
+  @spec live_workflow_for_test(String.t(), String.t()) :: String.t()
+  def live_workflow_for_test(project_slug, workspace_root) do
+    live_workflow(project_slug, workspace_root)
+  end
+
+  @doc false
   @spec validate_agent_workbench_statuses([map()]) :: :ok | {:error, map()}
   def validate_agent_workbench_statuses(states) when is_list(states) do
     names =
@@ -257,7 +267,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   def validate_agent_workbench_statuses(_states), do: {:error, %{expected: @expected_status_names, actual: []}}
 
   defp do_run(opts, deps) do
-    lanes = selected_lanes!(opts)
+    lanes = selected_lanes!(opts, deps)
     output_path = output_path(opts, deps)
     team_name = Keyword.get(opts, :team_name, @default_team_name)
     project_name = Keyword.get(opts, :project_name, @default_project_name)
@@ -298,32 +308,42 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     :ok
   end
 
-  defp selected_lanes!(opts) do
+  defp selected_lanes!(opts, deps) do
     lanes =
-      opts
-      |> Keyword.get_values(:lane)
-      |> case do
-        [] -> @default_lanes
-        values -> values
-      end
+      selected_lane_values(opts, deps)
+      |> Enum.flat_map(&split_lane_value/1)
       |> Enum.map(&normalize_lane!/1)
 
     cond do
+      lanes == [] ->
+        Mix.raise("At least one Phase 3.6 live-smoke lane is required.")
+
       Enum.uniq(lanes) != lanes ->
         Mix.raise("Duplicate live-smoke lanes are not allowed: #{Enum.join(lanes, ", ")}")
-
-      Enum.count(lanes, &(&1 in ["test", "bug"])) != 1 ->
-        Mix.raise("Phase 3.6 live smoke requires exactly one of `test` or `bug`.")
-
-      "docs" not in lanes or "research" not in lanes ->
-        Mix.raise("Phase 3.6 live smoke requires docs, research, and exactly one of test or bug.")
-
-      length(lanes) != 3 ->
-        Mix.raise("Phase 3.6 live smoke is limited to exactly three lanes.")
 
       true ->
         lanes
     end
+  end
+
+  defp selected_lane_values(opts, deps) do
+    case Keyword.get_values(opts, :lane) do
+      [] ->
+        case deps.getenv.("PHASE36_SMOKE_LANES") do
+          value when is_binary(value) and value != "" -> [value]
+          _ -> @default_lanes
+        end
+
+      values ->
+        values
+    end
+  end
+
+  defp split_lane_value(value) when is_binary(value) do
+    value
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
   end
 
   defp normalize_lane!(lane) when is_binary(lane) do
@@ -353,7 +373,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
     Mutations after confirmation:
     - create one Linear issue per requested lane if the runner needs a fresh issue
-    - run only docs, #{Enum.find(lanes, &(&1 in ["test", "bug"]))}, and research through AgentRunner
+    - run requested lanes through AgentRunner
     - allow repo-changing lanes to create branches, commits, pushes, draft PRs, and Linear handoff comments through existing gates
     - collect evidence without marking unavailable telemetry as successful
 
@@ -399,12 +419,14 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       team: team,
       project: project,
       states: states,
-      todo_state_id: state_id!(states, "Todo")
+      todo_state_id: state_id!(states, "Todo"),
+      in_progress_state_id: state_id!(states, "In Progress")
     }
   end
 
   defp run_lane!(lane, preflight, output_path, deps) do
     issue = create_issue!(lane, preflight, deps)
+    issue = start_issue!(issue, preflight, deps)
     classification = LaneClassifier.classify(issue)
     issue = %{issue | lane_classification: classification}
 
@@ -433,6 +455,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       ])
     else
       evidence
+    end
+  end
+
+  defp start_issue!(issue, preflight, deps) do
+    case deps.move_issue_to_state.(issue, "In Progress") do
+      :ok ->
+        %{issue | state: "In Progress", state_id: preflight.in_progress_state_id}
+
+      {:error, reason} ->
+        Mix.raise("Failed to move #{issue.identifier} to In Progress before live smoke: #{inspect(reason)}")
     end
   end
 
@@ -473,8 +505,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
       Scope:
       - Change only documentation under docs/.
-      - Commit and push the docs-only branch.
-      - Emit SYMPHONY_HANDOFF_READY only after the repository work is committed and pushed.
+      - Leave branch creation, commit, push, and draft PR publication to the parent handoff.
+      - Emit SYMPHONY_HANDOFF_READY only after the repository edit is complete.
 
       Validation:
       - No code validation required.
@@ -519,6 +551,66 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
       Validation:
       - Run the targeted test command that demonstrates the failure is fixed.
+      """
+    }
+  end
+
+  defp issue_input("feature") do
+    %{
+      title: "Feature live smoke: add a tiny Phase 3.6 runner note",
+      description: """
+      Lane: feature
+
+      Goal:
+      Implement the smallest coherent user-visible feature proving feature lane behavior.
+
+      Scope:
+      - Prefer a tiny documentation-backed or validation-surface feature related to Phase 3.6 evidence.
+      - Include tests or docs evidence, or explicitly justify why one is not appropriate.
+      - Commit, push, and emit SYMPHONY_HANDOFF_READY only after validation passes.
+
+      Validation:
+      - Run relevant validation for the changed surface.
+      """
+    }
+  end
+
+  defp issue_input("refactor") do
+    %{
+      title: "Refactor live smoke: preserve Phase 3.6 evidence behavior",
+      description: """
+      Lane: refactor
+
+      Goal:
+      Make a tiny behavior-preserving refactor in Phase 3.6 live-smoke evidence handling.
+
+      Scope:
+      - Preserve behavior.
+      - Document behavior-preservation evidence in the handoff.
+      - Commit, push, and emit SYMPHONY_HANDOFF_READY only after validation passes.
+
+      Validation:
+      - Run focused validation proving behavior is preserved.
+      """
+    }
+  end
+
+  defp issue_input("chore") do
+    %{
+      title: "Chore live smoke: maintain Phase 3.6 validation metadata",
+      description: """
+      Lane: chore
+
+      Goal:
+      Make a tiny maintenance-only change proving chore lane behavior.
+
+      Scope:
+      - Limit changes to validation metadata, scripts, or config directly relevant to Phase 3.6.
+      - Avoid product behavior changes.
+      - Commit, push, and emit SYMPHONY_HANDOFF_READY only after relevant validation passes.
+
+      Validation:
+      - Run validation relevant to the maintenance surface.
       """
     }
   end
@@ -774,7 +866,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       end
 
       Workflow.set_workflow_file_path(workflow_path)
-      :ok = AgentRunner.run(issue, self(), max_turns: lane_max_turns(issue))
+      :ok = AgentRunner.run(issue, self(), max_turns: lane_max_turns(issue), auto_publish_from_main: true)
 
       {:ok,
        collect_runtime_messages(issue.id)
@@ -812,6 +904,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     workspace:
       root: #{workspace_root}
     hooks:
+      timeout_ms: 180000
       after_create: |
         git clone git@github-personal:moizghumann/symphony.git .
         if command -v mise >/dev/null 2>&1; then
@@ -826,6 +919,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       thread_sandbox: workspace-write
       turn_sandbox_policy:
         type: workspaceWrite
+        writableRoots:
+          - #{workspace_root}
+          - #{workspace_root}/.git
+        networkAccess: true
     protocol:
       version: "1"
       repo_changes_require_pr: true
@@ -847,12 +944,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     This is a Phase 3.6 live-smoke run for `moizghumann/symphony`.
     Follow the lane packet exactly. Do not start Phase 4.
     Do not weaken protocol gates. Do not fake live-smoke success.
+    The current working directory is already the managed repository clone.
+    Make the requested file edit only. Leave branch creation, commit, push, and draft PR publication to the parent handoff.
+    Do not create a second clone or work from `/tmp` for repository changes.
     """
   end
 
-  defp lane_max_turns(%Issue{lane_classification: %{lane: :docs}}), do: 3
-  defp lane_max_turns(%Issue{lane_classification: %{lane: :research}}), do: 4
-  defp lane_max_turns(%Issue{lane_classification: %{lane: lane}}) when lane in [:test, :bug], do: 6
+  defp lane_max_turns(%Issue{lane_classification: %{lane: lane}}) when is_atom(lane) do
+    LanePolicy.policy_for(lane).max_turns
+  end
+
   defp lane_max_turns(_issue), do: 3
 
   defp collect_runtime_messages(issue_id) do
@@ -1042,6 +1143,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       getenv: &System.get_env/1,
       github_preflight: &default_github_preflight/0,
       linear_graphql: &default_linear_graphql/2,
+      move_issue_to_state: &Tracker.move_issue_to_state/2,
       run_agent: &default_run_agent/3,
       write_file: &File.write!/2,
       now: &DateTime.utc_now/0,
