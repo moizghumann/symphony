@@ -5,6 +5,8 @@ defmodule SymphonyElixir.Protocol.Validation do
 
   alias SymphonyElixir.Protocol.FinalizationGate
 
+  @evidence_fields [:targeted_tests_run, :test_coverage_added, :validation_command]
+
   @spec summarize(Path.t(), [String.t()]) :: map()
   def summarize(workspace, changed_files), do: summarize(workspace, changed_files, [])
 
@@ -15,12 +17,14 @@ defmodule SymphonyElixir.Protocol.Validation do
 
     case read_validation_artifact(artifact) do
       {:ok, %{} = payload} ->
-        %{
+        payload
+        |> evidence_fields()
+        |> Map.merge(%{
           validation_required: validation_required?(lane, changed_files),
-          validation_status: normalize_status(Map.get(payload, "status") || Map.get(payload, :status)),
-          validation_reason: Map.get(payload, "reason") || Map.get(payload, :reason),
+          validation_status: normalize_status(payload_value(payload, :status) || payload_value(payload, :validation_status)),
+          validation_reason: payload_value(payload, :reason) || payload_value(payload, :validation_reason),
           validation_artifact_path: artifact
-        }
+        })
 
       _ ->
         if validation_required?(lane, changed_files) do
@@ -63,6 +67,40 @@ defmodule SymphonyElixir.Protocol.Validation do
   end
 
   defp validation_artifact(workspace), do: Path.join([workspace, ".git", "symphony-validation.json"])
+
+  defp evidence_fields(payload) do
+    payload
+    |> copy_evidence_fields(@evidence_fields)
+    |> maybe_put_command_alias(payload)
+  end
+
+  defp copy_evidence_fields(payload, fields) do
+    Enum.reduce(fields, %{}, fn field, acc ->
+      case payload_value(payload, field) do
+        nil -> acc
+        value -> Map.put(acc, field, value)
+      end
+    end)
+  end
+
+  defp maybe_put_command_alias(%{validation_command: _command} = evidence, _payload), do: evidence
+
+  defp maybe_put_command_alias(evidence, payload) do
+    case payload_value(payload, :command) do
+      nil -> evidence
+      command -> Map.put(evidence, :validation_command, command)
+    end
+  end
+
+  defp payload_value(payload, key) when is_map(payload) do
+    string_key = to_string(key)
+
+    cond do
+      Map.has_key?(payload, string_key) -> Map.get(payload, string_key)
+      Map.has_key?(payload, key) -> Map.get(payload, key)
+      true -> nil
+    end
+  end
 
   defp read_validation_artifact(path) do
     with true <- File.regular?(path),
