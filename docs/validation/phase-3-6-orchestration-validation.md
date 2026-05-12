@@ -96,6 +96,8 @@ Validated:
 
 real smoke tests attempted but not run to mutation
 
+AGE-20 now covers the docs-lane repository-changing smoke path with a docs-only edit and `not_run` validation.
+
 Latest preflight attempt, 2026-05-11:
 
 - `RUN_REAL_SMOKE=true`
