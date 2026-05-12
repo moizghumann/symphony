@@ -1189,11 +1189,89 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
 
+      assert {:ok, canonical_git_root} =
+               SymphonyElixir.PathSafety.canonicalize(git_root)
+
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
-               "writableRoots" => [workspace_root, git_root],
+               "writableRoots" => [workspace_root, canonical_git_root],
                "networkAccess" => true
              }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy adds canonical active git root for AppServer workspace path" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-canonical-git-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "AGE-19")
+      git_root = Path.join(issue_workspace, ".git")
+      File.mkdir_p!(git_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: [workspace_root],
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
+      assert {:ok, canonical_git_root} =
+               SymphonyElixir.PathSafety.canonicalize(git_root)
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(canonical_issue_workspace)
+
+      assert runtime_settings.turn_sandbox_policy["type"] == "workspaceWrite"
+      assert workspace_root in runtime_settings.turn_sandbox_policy["writableRoots"]
+      assert canonical_git_root in runtime_settings.turn_sandbox_policy["writableRoots"]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy excludes unrelated git directories" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-unrelated-git-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "AGE-19")
+      unrelated_workspace = Path.join(test_root, "other")
+      git_root = Path.join(issue_workspace, ".git")
+      unrelated_git_root = Path.join(unrelated_workspace, ".git")
+      File.mkdir_p!(git_root)
+      File.mkdir_p!(unrelated_git_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: [workspace_root],
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, canonical_unrelated_git_root} =
+               SymphonyElixir.PathSafety.canonicalize(unrelated_git_root)
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+
+      refute canonical_unrelated_git_root in runtime_settings.turn_sandbox_policy["writableRoots"]
+      refute unrelated_git_root in runtime_settings.turn_sandbox_policy["writableRoots"]
     after
       File.rm_rf(test_root)
     end

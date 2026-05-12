@@ -590,9 +590,10 @@ defmodule SymphonyElixir.Config.Schema do
   defp add_git_root_when_workspace_covered(policy, workspace) do
     writable_roots = Map.get(policy, "writableRoots") || Map.get(policy, :writableRoots)
     expanded_workspace = Path.expand(workspace)
-    git_root = Path.join(expanded_workspace, ".git")
+    canonical_workspace = canonical_path_or_expanded(expanded_workspace)
+    git_root = Path.join(canonical_workspace, ".git")
 
-    if is_list(writable_roots) and File.dir?(git_root) and Enum.any?(writable_roots, &covers_workspace?(&1, expanded_workspace)) do
+    if is_list(writable_roots) and File.dir?(git_root) and Enum.any?(writable_roots, &covers_workspace?(&1, canonical_workspace)) do
       roots =
         writable_roots
         |> Enum.map(&to_string/1)
@@ -608,12 +609,21 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp sandbox_type(policy), do: Map.get(policy, "type") || Map.get(policy, :type)
 
-  defp covers_workspace?(root, expanded_workspace) when is_binary(root) do
+  defp covers_workspace?(root, canonical_workspace) when is_binary(root) do
     expanded_root = Path.expand(root)
-    expanded_workspace == expanded_root or String.starts_with?(expanded_workspace, expanded_root <> "/")
+    canonical_root = canonical_path_or_expanded(expanded_root)
+
+    canonical_workspace == canonical_root or String.starts_with?(canonical_workspace, canonical_root <> "/")
   end
 
-  defp covers_workspace?(_root, _expanded_workspace), do: false
+  defp covers_workspace?(_root, _canonical_workspace), do: false
+
+  defp canonical_path_or_expanded(path) when is_binary(path) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} -> canonical_path
+      {:error, _reason} -> Path.expand(path)
+    end
+  end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
     do: workspace

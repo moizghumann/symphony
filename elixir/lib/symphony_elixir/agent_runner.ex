@@ -93,12 +93,52 @@ defmodule SymphonyElixir.AgentRunner do
       worker_host: worker_host
     }
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with :ok <- run_before_codex_start_hook(workspace, issue, turn_context),
+         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
         do_run_codex_turns(session, issue, turn_context, 1, max_turns)
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp run_before_codex_start_hook(workspace, issue, turn_context) do
+    case Keyword.get(turn_context.opts, :before_codex_start) do
+      hook when is_function(hook, 3) ->
+        case hook.(workspace, issue, turn_context.worker_host) do
+          :ok ->
+            :ok
+
+          {:ok, metadata} when is_map(metadata) ->
+            send_codex_update(
+              turn_context.codex_update_recipient,
+              issue,
+              metadata
+              |> Map.put_new(:event, :before_codex_start_completed)
+              |> Map.put_new(:timestamp, DateTime.utc_now())
+            )
+
+            :ok
+
+          {:error, reason, metadata} when is_map(metadata) ->
+            send_codex_update(
+              turn_context.codex_update_recipient,
+              issue,
+              metadata
+              |> Map.put_new(:event, :before_codex_start_failed)
+              |> Map.put_new(:reason, reason)
+              |> Map.put_new(:timestamp, DateTime.utc_now())
+            )
+
+            {:error, {:before_codex_start_failed, reason}}
+
+          {:error, reason} ->
+            {:error, {:before_codex_start_failed, reason}}
+        end
+
+      _ ->
+        :ok
     end
   end
 

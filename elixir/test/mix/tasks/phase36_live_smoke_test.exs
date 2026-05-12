@@ -2,6 +2,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
   use ExUnit.Case, async: false
 
   alias Mix.Tasks.Phase36.LiveSmoke
+  alias SymphonyElixir.Linear.Issue
 
   import ExUnit.CaptureIO
 
@@ -293,6 +294,9 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["completion_states"]["codex_work_observed"] == true
     assert lane_result["completion_states"]["symphony_handoff_ready_seen"] == true
     assert lane_result["completion_states"]["lane_contract_satisfied"] == true
+    assert lane_result["sandbox_policy_type"] == "workspaceWrite"
+    assert lane_result["active_workspace_git_root_writable_probe"]["status"] == "ok"
+    assert lane_result["active_workspace_git_root"] in lane_result["sandbox_writable_roots"]
     assert lane_result["repo_changed"] == true
     assert lane_result["product_changed_files"] == ["docs/validation/phase-3-6-orchestration-validation.md"]
     assert lane_result["control_artifacts"] == [".phase36/handoff.json"]
@@ -839,6 +843,100 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert workflow =~ "networkAccess: true"
   end
 
+  test "live-smoke Codex preflight records sandbox policy and writable git probe" do
+    workspace_path = temp_workspace_path()
+    git_root = Path.join(workspace_path, ".git")
+    File.mkdir_p!(git_root)
+
+    write_live_smoke_workflow!(Path.dirname(workspace_path), workspace_path)
+
+    issue = %Issue{lane_classification: %{lane: :docs}}
+
+    assert {:ok, canonical_workspace_path} =
+             SymphonyElixir.PathSafety.canonicalize(workspace_path)
+
+    assert {:ok, canonical_git_root} =
+             SymphonyElixir.PathSafety.canonicalize(git_root)
+
+    assert {:ok, metadata} =
+             LiveSmoke.live_smoke_codex_start_preflight_for_test(canonical_workspace_path, issue, nil)
+
+    assert metadata["sandbox_policy_type"] == "workspaceWrite"
+    assert metadata["active_workspace_path"] == canonical_workspace_path
+    assert metadata["active_workspace_git_root"] == canonical_git_root
+    assert metadata["active_workspace_git_root_writable_probe"]["status"] == "ok"
+    assert canonical_git_root in metadata["sandbox_writable_roots"]
+
+    File.rm_rf(workspace_path)
+  end
+
+  test "live-smoke Codex preflight blocks repo-changing lanes before Codex when git root is missing" do
+    workspace_path = temp_workspace_path()
+    File.mkdir_p!(workspace_path)
+
+    write_live_smoke_workflow!(Path.dirname(workspace_path), workspace_path)
+
+    issue = %Issue{lane_classification: %{lane: :docs}}
+
+    assert {:error, "active_workspace_git_root_missing", metadata} =
+             LiveSmoke.live_smoke_codex_start_preflight_for_test(workspace_path, issue, nil)
+
+    assert metadata["active_workspace_git_root_writable_probe"]["status"] == "missing"
+
+    File.rm_rf(workspace_path)
+  end
+
+  test "evidence includes active sandbox roots and failed git probe" do
+    output_path = temp_output_path()
+    workspace_path = temp_workspace_path()
+    git_root = Path.join(workspace_path, ".git")
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          {:error,
+           {:before_codex_start_failed, "active_workspace_git_root_not_writable"},
+           %{
+             "workspace_path" => workspace_path,
+             "active_workspace_path" => workspace_path,
+             "active_workspace_git_root" => git_root,
+             "active_workspace_git_root_writable_probe" => %{
+               "status" => "error",
+               "path" => Path.join(git_root, ".probe"),
+               "reason" => ":eacces"
+             },
+             "sandbox_policy_type" => "workspaceWrite",
+             "sandbox_writable_roots" => [workspace_path, git_root],
+             "completion_states" => %{
+               "codex_process_started" => false,
+               "codex_prompt_delivered" => false,
+               "codex_work_observed" => false,
+               "symphony_handoff_ready_seen" => false
+             }
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["blocked_transition"]["status"] == "blocked"
+    assert lane_result["sandbox_policy_type"] == "workspaceWrite"
+    assert lane_result["sandbox_writable_roots"] == [workspace_path, git_root]
+    assert lane_result["active_workspace_path"] == workspace_path
+    assert lane_result["active_workspace_git_root"] == git_root
+    assert lane_result["active_workspace_git_root_writable_probe"]["status"] == "error"
+
+    File.rm(output_path)
+  end
+
   defp inert_deps(overrides \\ %{}) do
     Map.merge(
       %{
@@ -908,6 +1006,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     workspace_path = temp_workspace_path()
     File.mkdir_p!(workspace_path)
     File.mkdir_p!(Path.join(workspace_path, ".phase36"))
+    File.mkdir_p!(Path.join(workspace_path, ".git"))
 
     case artifact_mode do
       :missing ->
@@ -936,6 +1035,11 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
         "narrow_linear_lifecycle_calls" => 1,
         "budget_state" => "ok",
         "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"],
+        "sandbox_policy_type" => "workspaceWrite",
+        "sandbox_writable_roots" => [workspace_path, Path.join(workspace_path, ".git")],
+        "active_workspace_path" => workspace_path,
+        "active_workspace_git_root" => Path.join(workspace_path, ".git"),
+        "active_workspace_git_root_writable_probe" => %{"status" => "ok", "path" => Path.join(workspace_path, ".git/.probe")},
         "codex_app_server_pid" => "12345",
         "completion_states" => %{
           "codex_process_started" => true,
@@ -950,6 +1054,21 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
   defp temp_workspace_path do
     Path.join(System.tmp_dir!(), "phase36-live-smoke-workspace-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}")
+  end
+
+  defp write_live_smoke_workflow!(workspace_root, issue_workspace) do
+    original_workflow_path = SymphonyElixir.Workflow.workflow_file_path()
+    workflow_path = Path.join(issue_workspace, "WORKFLOW.md")
+
+    File.mkdir_p!(issue_workspace)
+
+    on_exit(fn ->
+      SymphonyElixir.Workflow.set_workflow_file_path(original_workflow_path)
+      File.rm_rf(issue_workspace)
+    end)
+
+    File.write!(workflow_path, LiveSmoke.live_workflow_for_test("phase36", workspace_root))
+    SymphonyElixir.Workflow.set_workflow_file_path(workflow_path)
   end
 
   defp valid_github_verification(artifact, context) do

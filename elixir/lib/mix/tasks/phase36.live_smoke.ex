@@ -1200,6 +1200,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "handoff_artifact_status" => artifact_value(artifact_result, ["status"]),
         "external_verification" => Map.drop(external_verification, ["violations"]),
         "runner_status" => runner_result_status(runner_result),
+        "sandbox_policy_type" => Map.get(telemetry, "sandbox_policy_type"),
+        "sandbox_writable_roots" => Map.get(telemetry, "sandbox_writable_roots"),
+        "active_workspace_path" => Map.get(telemetry, "active_workspace_path") || Map.get(telemetry, "workspace_path"),
+        "active_workspace_git_root" => Map.get(telemetry, "active_workspace_git_root"),
+        "active_workspace_git_root_writable_probe" => Map.get(telemetry, "active_workspace_git_root_writable_probe"),
         "lane_contract_status" => nil,
         "completion_states" => %{},
         "blocker_reason" => nil,
@@ -1907,7 +1912,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
       Workflow.set_workflow_file_path(workflow_path)
 
-      case AgentRunner.run(issue, self(), max_turns: lane_max_turns(issue), auto_publish_from_main: true) do
+      case AgentRunner.run(issue, self(),
+             max_turns: lane_max_turns(issue),
+             auto_publish_from_main: true,
+             before_codex_start: &live_smoke_codex_start_preflight/3
+           ) do
         :ok ->
           {:ok,
            collect_runtime_messages(issue.id)
@@ -1936,6 +1945,117 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     File.write!(workflow_path, live_workflow(preflight.project["slugId"], root))
     workflow_path
   end
+
+  @doc false
+  @spec live_smoke_codex_start_preflight_for_test(Path.t(), Issue.t(), term()) ::
+          :ok | {:ok, map()} | {:error, String.t(), map()}
+  def live_smoke_codex_start_preflight_for_test(workspace, issue, worker_host) do
+    live_smoke_codex_start_preflight(workspace, issue, worker_host)
+  end
+
+  defp live_smoke_codex_start_preflight(workspace, issue, nil) do
+    metadata = live_smoke_sandbox_metadata(workspace)
+
+    if repo_changing_issue?(issue) do
+      probe = Map.get(metadata, "active_workspace_git_root_writable_probe") || %{}
+
+      cond do
+        probe["status"] == "ok" ->
+          if active_git_root_in_sandbox?(metadata) do
+            {:ok, metadata}
+          else
+            {:error, "active_workspace_git_root_not_in_sandbox_writable_roots", metadata}
+          end
+
+        probe["status"] == "missing" ->
+          {:error, "active_workspace_git_root_missing", metadata}
+
+        true ->
+          {:error, "active_workspace_git_root_not_writable", metadata}
+      end
+    else
+      {:ok, metadata}
+    end
+  end
+
+  defp live_smoke_codex_start_preflight(workspace, _issue, worker_host) when is_binary(worker_host) do
+    {:ok,
+     %{
+       "active_workspace_path" => workspace,
+       "active_workspace_git_root" => Path.join(workspace, ".git"),
+       "active_workspace_git_root_writable_probe" => %{
+         "status" => "skipped",
+         "reason" => "remote_worker_preflight_not_supported_locally"
+       }
+     }}
+  end
+
+  defp live_smoke_sandbox_metadata(workspace) do
+    git_root = Path.join(workspace, ".git")
+    runtime_settings = Config.codex_runtime_settings(workspace)
+
+    policy =
+      case runtime_settings do
+        {:ok, settings} -> settings.turn_sandbox_policy
+        {:error, _reason} -> %{}
+      end
+
+    %{
+      "active_workspace_path" => workspace,
+      "active_workspace_git_root" => git_root,
+      "active_workspace_git_root_writable_probe" => probe_git_root_writable(git_root),
+      "sandbox_policy_type" => sandbox_policy_type(policy),
+      "sandbox_writable_roots" => sandbox_writable_roots(policy)
+    }
+  end
+
+  defp repo_changing_issue?(%Issue{lane_classification: %{lane: lane}}) when is_atom(lane) do
+    repo_changing_lane?(Atom.to_string(lane))
+  end
+
+  defp repo_changing_issue?(%Issue{lane_classification: %{lane: lane}}) when is_binary(lane) do
+    repo_changing_lane?(lane)
+  end
+
+  defp repo_changing_issue?(_issue), do: true
+
+  defp active_git_root_in_sandbox?(metadata) do
+    git_root = Map.get(metadata, "active_workspace_git_root")
+    writable_roots = Map.get(metadata, "sandbox_writable_roots") || []
+
+    is_binary(git_root) and git_root in writable_roots
+  end
+
+  defp probe_git_root_writable(git_root) when is_binary(git_root) do
+    cond do
+      not File.dir?(git_root) ->
+        %{"status" => "missing", "path" => git_root}
+
+      true ->
+        probe_path = Path.join(git_root, ".symphony-live-smoke-write-probe-#{System.unique_integer([:positive])}")
+
+        case File.write(probe_path, "probe") do
+          :ok ->
+            _ = File.rm(probe_path)
+            %{"status" => "ok", "path" => probe_path}
+
+          {:error, reason} ->
+            %{"status" => "error", "path" => probe_path, "reason" => inspect(reason)}
+        end
+    end
+  end
+
+  defp sandbox_policy_type(policy) when is_map(policy), do: Map.get(policy, "type") || Map.get(policy, :type)
+  defp sandbox_policy_type(_policy), do: nil
+
+  defp sandbox_writable_roots(policy) when is_map(policy) do
+    case Map.get(policy, "writableRoots") || Map.get(policy, :writableRoots) do
+      roots when is_list(roots) -> Enum.map(roots, &to_string/1)
+      _ -> []
+    end
+  end
+
+  defp sandbox_writable_roots(_policy), do: []
 
   defp live_workflow(project_slug, workspace_root) do
     """
@@ -2050,6 +2170,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     |> Map.merge(token_usage(messages))
     |> Map.merge(workspace_git_telemetry(messages))
     |> Map.merge(session_telemetry(messages))
+    |> Map.merge(sandbox_telemetry(messages))
     |> Map.merge(completion_telemetry(messages))
   end
 
@@ -2157,6 +2278,18 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "session_id" => messages |> Enum.find_value(&map_get(&1, :session_id)),
       "codex_app_server_pid" => messages |> Enum.find_value(&map_get(&1, :codex_app_server_pid)),
       "last_output_at" => messages |> Enum.map(&map_get(&1, :timestamp)) |> Enum.reject(&is_nil/1) |> List.last() |> normalize_timestamp()
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp sandbox_telemetry(messages) do
+    %{
+      "sandbox_policy_type" => messages |> Enum.find_value(&map_get(&1, :sandbox_policy_type)),
+      "sandbox_writable_roots" => messages |> Enum.find_value(&map_get(&1, :sandbox_writable_roots)),
+      "active_workspace_path" => messages |> Enum.find_value(&map_get(&1, :active_workspace_path)),
+      "active_workspace_git_root" => messages |> Enum.find_value(&map_get(&1, :active_workspace_git_root)),
+      "active_workspace_git_root_writable_probe" => messages |> Enum.find_value(&map_get(&1, :active_workspace_git_root_writable_probe))
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
