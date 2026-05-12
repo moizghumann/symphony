@@ -2,8 +2,8 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
-  alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate}
+  alias SymphonyElixir.{GitHubHandoff, JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
+  alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate, Validation}
 
   @contract %Contract{}
   @states [
@@ -175,6 +175,151 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert violation?(missing_result, :pr_required_but_missing)
       refute violation?(missing_result, :ticket_conflicts_with_workflow_policy)
       assert warning?(missing_result, :ticket_conflicts_with_workflow_policy)
+    end
+
+    test "test lane live-smoke validation artifact carries evidence into finalization gate" do
+      workspace =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-live-smoke-evidence-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(Path.join(workspace, ".git"))
+
+      on_exit(fn ->
+        File.rm_rf(workspace)
+      end)
+
+      validation_command =
+        "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs"
+
+      validation_reason = "targeted Phase 3.6 live-smoke regression test passed"
+
+      validation_artifact = %{
+        "validation_status" => "passed",
+        "validation_reason" => validation_reason,
+        "validation_command" => validation_command,
+        "targeted_tests_run" => true,
+        "test_coverage_added" => true
+      }
+
+      File.write!(
+        Path.join([workspace, ".git", "symphony-validation.json"]),
+        Jason.encode!(validation_artifact)
+      )
+
+      changed_files = ["elixir/test/symphony_elixir/phase36_orchestration_validation_test.exs"]
+      validation = Validation.summarize(workspace, changed_files, lane: "test")
+
+      assert validation.validation_required == true
+      assert validation.validation_status == :passed
+      assert validation.validation_reason == validation_reason
+      assert validation.validation_command == validation_command
+      assert validation.targeted_tests_run == true
+      assert validation.test_coverage_added == true
+
+      run_state =
+        run_state(
+          Map.merge(validation, %{
+            lane: "test",
+            changed_files: changed_files
+          })
+        )
+
+      assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+      assert result.finalization_gate_result == :ok
+    end
+
+    test "GitHub handoff uses resolved test lane and live-smoke validation evidence" do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-github-handoff-evidence-#{System.unique_integer([:positive])}"
+        )
+
+      previous_path = System.get_env("PATH")
+      previous_gh_log = System.get_env("GH_LOG")
+
+      try do
+        repo = Path.join(test_root, "repo")
+        origin = Path.join(test_root, "origin.git")
+        bin_dir = Path.join(test_root, "bin")
+        gh_log = Path.join(test_root, "gh.log")
+        branch = "agent/phase36-test-evidence"
+
+        File.mkdir_p!(Path.join(repo, "elixir/test/symphony_elixir"))
+        File.mkdir_p!(bin_dir)
+        File.write!(Path.join(repo, "README.md"), "# test\n")
+        System.cmd("git", ["init", "-b", "main"], cd: repo)
+        System.cmd("git", ["config", "user.name", "Test User"], cd: repo)
+        System.cmd("git", ["config", "user.email", "test@example.com"], cd: repo)
+        System.cmd("git", ["add", "README.md"], cd: repo)
+        System.cmd("git", ["commit", "-m", "initial"], cd: repo)
+        System.cmd("git", ["init", "--bare", origin])
+        System.cmd("git", ["remote", "add", "origin", origin], cd: repo)
+        System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
+
+        System.cmd("git", ["switch", "-c", branch], cd: repo)
+
+        File.write!(
+          Path.join(repo, "elixir/test/symphony_elixir/phase36_orchestration_validation_test.exs"),
+          """
+          defmodule Phase36EvidenceTest do
+            use ExUnit.Case
+
+            test "live smoke evidence", do: assert(true)
+          end
+          """
+        )
+
+        System.cmd("git", ["add", "."], cd: repo)
+        System.cmd("git", ["commit", "-m", "Add live smoke evidence regression"], cd: repo)
+        System.cmd("git", ["push", "-u", "origin", branch], cd: repo)
+
+        File.write!(
+          Path.join(repo, ".git/symphony-validation.json"),
+          Jason.encode!(%{
+            "validation_status" => "passed",
+            "validation_reason" => "targeted live-smoke evidence test passed",
+            "validation_command" => "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs",
+            "targeted_tests_run" => true,
+            "test_coverage_added" => true
+          })
+        )
+
+        File.write!(Path.join(bin_dir, "gh"), """
+        #!/bin/sh
+        printf '%s\\n' "$*" >> "$GH_LOG"
+        printf 'https://github.com/example/repo/pull/22\\n'
+        """)
+
+        File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+        System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+        System.put_env("GH_LOG", gh_log)
+
+        write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+        Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+        issue = %Issue{
+          id: "issue-phase36-test-handoff",
+          identifier: "AGE-22",
+          title: "Add regression tests for Phase 3.6 live smoke evidence",
+          state: "In Progress",
+          lane_classification: %{lane: :test},
+          available_states: @states
+        }
+
+        assert {:ok, "https://github.com/example/repo/pull/22"} = GitHubHandoff.complete(repo, issue)
+        assert File.read!(gh_log) =~ "pr create --draft --head #{branch} --base main"
+        assert_receive {:memory_tracker_comment, "issue-phase36-test-handoff", comment}
+        assert comment =~ "https://github.com/example/repo/pull/22"
+        assert_receive {:memory_tracker_state_update, "issue-phase36-test-handoff", "Human Review"}
+      after
+        restore_env("PATH", previous_path)
+        restore_env("GH_LOG", previous_gh_log)
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+        File.rm_rf(test_root)
+      end
     end
   end
 

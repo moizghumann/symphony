@@ -412,6 +412,13 @@ defmodule SymphonyElixir.GitHubHandoff do
   end
 
   defp infer_lane(%Issue{} = issue, changed_files) do
+    case classified_lane(issue.lane_classification) do
+      nil -> infer_lane_from_text(issue, changed_files)
+      lane -> lane
+    end
+  end
+
+  defp infer_lane_from_text(%Issue{} = issue, changed_files) do
     text =
       ([issue.title, issue.description] ++ List.wrap(issue.labels))
       |> Enum.reject(&is_nil/1)
@@ -426,6 +433,24 @@ defmodule SymphonyElixir.GitHubHandoff do
       true -> "feature"
     end
   end
+
+  defp classified_lane(%{lane: lane}), do: normalize_lane(lane)
+  defp classified_lane(%{"lane" => lane}), do: normalize_lane(lane)
+  defp classified_lane(_classification), do: nil
+
+  defp normalize_lane(lane) when is_atom(lane), do: lane |> Atom.to_string() |> normalize_lane()
+
+  defp normalize_lane(lane) when is_binary(lane) do
+    lane
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_lane(_lane), do: nil
 
   defp lane_from_text(text) do
     cond do
