@@ -1967,6 +1967,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       case AgentRunner.run(issue, self(),
              max_turns: lane_max_turns(issue),
              auto_publish_from_main: true,
+             lane: lane_name(issue),
              before_codex_start: &live_smoke_codex_start_preflight/3
            ) do
         :ok ->
@@ -2070,6 +2071,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   end
 
   defp repo_changing_issue?(_issue), do: true
+
+  defp lane_name(%Issue{lane_classification: %{lane: lane}}) when is_atom(lane), do: Atom.to_string(lane)
+  defp lane_name(%Issue{lane_classification: %{lane: lane}}) when is_binary(lane), do: lane
+  defp lane_name(_issue), do: "unknown"
 
   defp active_git_root_in_sandbox?(metadata) do
     git_root = Map.get(metadata, "active_workspace_git_root")

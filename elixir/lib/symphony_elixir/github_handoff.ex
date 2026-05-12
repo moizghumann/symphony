@@ -24,7 +24,7 @@ defmodule SymphonyElixir.GitHubHandoff do
     contract = Contract.current()
 
     with :ok <- ensure_git_repo(workspace, worker_host),
-         {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host),
+         {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host, opts),
          true <- artifacts.repo_changed,
          {:ok, branch} <- ensure_branch(workspace, issue, worker_host, opts),
          :ok <- ensure_committed(workspace, worker_host, issue, opts),
@@ -88,18 +88,19 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp repo_artifacts(workspace, %Issue{} = issue, worker_host) do
+  defp repo_artifacts(workspace, %Issue{} = issue, worker_host, opts) do
     with {:ok, status} <- run(workspace, "git", ["status", "--porcelain"], worker_host),
          {:ok, ahead} <- run(workspace, "git", ["rev-list", "--count", "origin/main..HEAD"], worker_host),
          {:ok, changed} <- changed_files(workspace, worker_host) do
       repo_changed = String.trim(status) != "" or parse_count(ahead) > 0 or changed != []
-      lane = infer_lane(issue, changed)
+      phase36_artifact = read_phase36_handoff_artifact(workspace, worker_host)
+      {lane, classification_reason} = selected_lane(opts, issue, phase36_artifact, changed)
       validation = Validation.summarize(workspace, changed, lane: lane)
 
       {:ok,
        Map.merge(validation, %{
          lane: lane,
-         classification_reason: "inferred from labels/title/files during handoff",
+         classification_reason: classification_reason,
          repo_changed: repo_changed,
          changed_files: changed,
          branch_name: nil,
@@ -113,7 +114,8 @@ defmodule SymphonyElixir.GitHubHandoff do
          available_states: issue.available_states,
          ticket_text: issue_text(issue),
          budget_state: :ok
-       })}
+       })
+       |> Map.merge(phase36_gate_evidence(phase36_artifact))}
     else
       {:error, reason} -> {:error, {:repo_artifacts_failed, reason}}
     end
@@ -582,6 +584,94 @@ defmodule SymphonyElixir.GitHubHandoff do
       _ -> 0
     end
   end
+
+  defp selected_lane(opts, %Issue{} = issue, artifact, changed_files) do
+    cond do
+      valid_lane?(Keyword.get(opts, :lane)) ->
+        {normalize_lane(Keyword.fetch!(opts, :lane)), "provided by handoff options"}
+
+      valid_lane?(issue_lane(issue)) ->
+        {normalize_lane(issue_lane(issue)), "preserved from issue lane classification"}
+
+      valid_lane?(artifact_lane(artifact)) ->
+        {normalize_lane(artifact_lane(artifact)), "preserved from .phase36/handoff.json"}
+
+      true ->
+        {infer_lane(issue, changed_files), "inferred from labels/title/files during handoff"}
+    end
+  end
+
+  defp issue_lane(%Issue{lane_classification: %{lane: lane}}), do: lane
+  defp issue_lane(%Issue{lane_classification: %{"lane" => lane}}), do: lane
+  defp issue_lane(_issue), do: nil
+
+  defp artifact_lane(%{} = artifact), do: Map.get(artifact, "lane") || Map.get(artifact, :lane)
+  defp artifact_lane(_artifact), do: nil
+
+  defp valid_lane?(lane) when is_atom(lane), do: lane |> Atom.to_string() |> valid_lane?()
+
+  defp valid_lane?(lane) when is_binary(lane) do
+    lane
+    |> String.downcase()
+    |> then(&(&1 in ["docs", "bug", "feature", "refactor", "test", "chore", "research"]))
+  end
+
+  defp valid_lane?(_lane), do: false
+
+  defp normalize_lane(lane) when is_atom(lane), do: lane |> Atom.to_string() |> normalize_lane()
+  defp normalize_lane(lane) when is_binary(lane), do: lane |> String.trim() |> String.downcase()
+
+  defp read_phase36_handoff_artifact(workspace, nil) do
+    path = Path.join(workspace, @phase36_handoff_path)
+
+    with true <- File.regular?(path),
+         {:ok, body} <- File.read(path),
+         {:ok, %{} = artifact} <- Jason.decode(body) do
+      artifact
+    else
+      _ -> nil
+    end
+  end
+
+  defp read_phase36_handoff_artifact(workspace, worker_host) do
+    case run(workspace, "cat", [@phase36_handoff_path], worker_host) do
+      {:ok, body} ->
+        case Jason.decode(body) do
+          {:ok, %{} = artifact} -> artifact
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp phase36_gate_evidence(nil), do: %{}
+
+  defp phase36_gate_evidence(%{} = artifact) do
+    validation = Map.get(artifact, "validation") || %{}
+
+    %{}
+    |> maybe_put(:targeted_tests_run, artifact_value(artifact, "targeted_tests_run"))
+    |> maybe_put(:test_coverage_added, artifact_value(artifact, "test_coverage_added"))
+    |> maybe_put(:validation_status, first_present([artifact_value(artifact, "validation_status"), artifact_value(validation, "status")]))
+    |> maybe_put(:validation_command, first_present([artifact_value(artifact, "validation_command"), artifact_value(validation, "command")]))
+    |> maybe_put(:validation_reason, first_present([artifact_value(artifact, "validation_reason"), artifact_value(validation, "reason")]))
+  end
+
+  defp artifact_value(%{} = artifact, key), do: Map.get(artifact, key) || Map.get(artifact, String.to_atom(key))
+  defp artifact_value(_artifact, _key), do: nil
+
+  defp first_present(values) do
+    Enum.find(values, fn
+      nil -> false
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> true
+    end)
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp infer_lane(%Issue{} = issue, changed_files) do
     text =

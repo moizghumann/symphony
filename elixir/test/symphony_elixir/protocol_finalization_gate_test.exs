@@ -139,6 +139,19 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert violation?(result, :bug_failure_signal_identified)
   end
 
+  test "bug lane blocks fix without affected-file inspection" do
+    run_state =
+      base_run_state(%{
+        lane: "bug",
+        changed_files: ["lib/product/runtime.ex"],
+        validation_status: :passed,
+        failure_signal_identified: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :affected_files_not_inspected)
+  end
+
   test "refactor lane allows behavior-preserving validated PR" do
     run_state =
       base_run_state(%{

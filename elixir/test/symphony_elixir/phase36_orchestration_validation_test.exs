@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
+  alias SymphonyElixir.{GitHubHandoff, JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
   alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate}
 
   @contract %Contract{}
@@ -35,6 +35,48 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
         assert is_list(signals) and signals != []
         assert is_binary(version) and version != ""
       end
+    end
+  end
+
+  describe "GitHub handoff lane preservation" do
+    test "prefers opts lane over inferred lane" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2201",
+          title: "Fix regression in checkout validation"
+        })
+
+      assert_handoff_reaches_human_review(issue, lane: "test")
+    end
+
+    test "prefers issue lane classification over inferred lane" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2202",
+          title: "Fix regression in checkout validation",
+          lane_classification: %{lane: :test, reason: "preclassified test lane"}
+        })
+
+      assert_handoff_reaches_human_review(issue)
+    end
+
+    test "reads lane from valid phase36 handoff artifact when issue classification is absent" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2203",
+          title: "Fix regression in checkout validation"
+        })
+
+      assert_handoff_reaches_human_review(issue)
+    end
+
+    test "add regression tests handoff stays test lane" do
+      issue = handoff_issue(%{identifier: "AGE-2204", title: "Add regression tests for handoff evidence"})
+      classification = LaneClassifier.classify(issue)
+
+      assert classification.lane == :test
+
+      assert_handoff_reaches_human_review(%{issue | lane_classification: classification})
     end
   end
 
@@ -365,6 +407,129 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       budget_state: :ok
     }
     |> Map.merge(overrides)
+  end
+
+  defp handoff_issue(overrides) do
+    defaults = %{
+      id: "issue-#{System.unique_integer([:positive])}",
+      identifier: "AGE-22",
+      title: "Add regression tests for validation",
+      description: "Exercise the Phase 3.6 test lane handoff.",
+      state: "In Progress",
+      branch_name: "symphony/age-22-lane-preservation",
+      labels: [],
+      url: "https://linear.app/symphonys/issue/AGE-22"
+    }
+
+    struct!(Issue, Map.merge(defaults, overrides))
+  end
+
+  defp assert_handoff_reaches_human_review(%Issue{} = issue, opts \\ []) do
+    test_root = Path.join(System.tmp_dir!(), "symphony-handoff-lane-preservation-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_lane_handoff_repo!(test_root, issue.identifier)
+      install_fake_gh!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      assert {:ok, "https://github.com/example/repo/pull/22"} =
+               GitHubHandoff.complete(repo, issue, nil, Keyword.merge([auto_publish_from_main: true], opts))
+
+      assert_receive {:memory_tracker_comment, issue_id, comment}, 1_000
+      assert issue_id == issue.id
+      assert comment =~ "https://github.com/example/repo/pull/22"
+      assert_receive {:memory_tracker_state_update, issue_id, "Human Review"}, 1_000
+      assert issue_id == issue.id
+
+      artifact = repo |> Path.join(".phase36/handoff.json") |> File.read!() |> Jason.decode!()
+      assert artifact["lane"] == "test"
+      assert artifact["handoff"]["final_state_requested"] == "Human Review"
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp prepare_lane_handoff_repo!(test_root, identifier) do
+    repo = Path.join(test_root, "repo")
+    origin = Path.join(test_root, "origin.git")
+
+    File.mkdir_p!(Path.join(repo, "test/product"))
+    File.write!(Path.join(repo, "README.md"), "# test\n")
+    System.cmd("git", ["init", "-b", "main"], cd: repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: repo)
+    System.cmd("git", ["add", "README.md"], cd: repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: repo)
+    System.cmd("git", ["init", "--bare", origin])
+    System.cmd("git", ["remote", "add", "origin", origin], cd: repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
+
+    File.write!(Path.join(repo, "test/product/runtime_test.exs"), "defmodule RuntimeTest do\n  use ExUnit.Case\n\n  test \"runtime\" do\n    assert true\n  end\nend\n")
+    File.mkdir_p!(Path.join(repo, ".phase36"))
+    File.write!(Path.join(repo, ".phase36/handoff.json"), phase36_test_handoff_artifact(identifier))
+
+    repo
+  end
+
+  defp install_fake_gh!(test_root) do
+    bin_dir = Path.join(test_root, "bin")
+    gh_log = Path.join(test_root, "gh.log")
+    File.mkdir_p!(bin_dir)
+
+    File.write!(Path.join(bin_dir, "gh"), """
+    #!/bin/sh
+    printf '%s\\n' "$*" >> "$GH_LOG"
+    if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+      printf 'no pull requests found\\n'
+      exit 1
+    fi
+    if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+      printf 'https://github.com/example/repo/pull/22\\n'
+      exit 0
+    fi
+    exit 99
+    """)
+
+    File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+    System.put_env("PATH", bin_dir <> ":" <> (System.get_env("PATH") || ""))
+    System.put_env("GH_LOG", gh_log)
+  end
+
+  defp phase36_test_handoff_artifact(identifier) do
+    Jason.encode!(
+      %{
+        "lane" => "test",
+        "linear_issue_identifier" => identifier,
+        "status" => "repository_edit_complete_parent_handoff_pending",
+        "repo_changed" => true,
+        "branch_name" => nil,
+        "commit_sha" => nil,
+        "pr_url" => nil,
+        "changed_files" => ["test/product/runtime_test.exs", ".phase36/handoff.json"],
+        "targeted_tests_run" => true,
+        "test_coverage_added" => true,
+        "validation_status" => "passed",
+        "validation_command" => "mix test test/product/runtime_test.exs",
+        "validation_reason" => "Focused regression test coverage passed.",
+        "validation" => %{
+          "required" => true,
+          "status" => "passed",
+          "command" => "mix test test/product/runtime_test.exs",
+          "reason" => "Focused regression test coverage passed."
+        },
+        "handoff" => %{
+          "linear_comment_posted" => false,
+          "final_state_requested" => false
+        }
+      },
+      pretty: true
+    )
   end
 
   defp running_entry(%Issue{} = issue, overrides) do

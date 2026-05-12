@@ -206,6 +206,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp complete_handoff(workspace, issue, worker_host, codex_update_recipient, opts) do
     handoff_opts =
       opts
+      |> Keyword.put_new(:lane, lane_name(issue))
       |> Keyword.put(:lifecycle_recorder, lifecycle_recorder(codex_update_recipient, issue))
 
     case GitHubHandoff.complete(workspace, issue, worker_host, handoff_opts) do
