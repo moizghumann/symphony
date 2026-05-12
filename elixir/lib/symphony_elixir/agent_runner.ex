@@ -5,10 +5,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, GitHubHandoff, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, GitHubHandoff, Linear.Issue, PromptBuilder, SSH, Tracker, Workspace}
   alias SymphonyElixir.Protocol.{Contract, FinalizationGate}
 
   @handoff_ready_marker "SYMPHONY_HANDOFF_READY"
+  @phase36_handoff_path ".phase36/handoff.json"
 
   @type worker_host :: String.t() | nil
 
@@ -209,7 +210,22 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put_new(:lane, lane_name(issue))
       |> Keyword.put(:lifecycle_recorder, lifecycle_recorder(codex_update_recipient, issue))
 
-    case GitHubHandoff.complete(workspace, issue, worker_host, handoff_opts) do
+    case research_handoff_route(workspace, issue, worker_host) do
+      {:read_only_research, artifact} ->
+        complete_read_only_research_handoff(issue, artifact, handoff_opts)
+
+      {:blocked_research, reason} ->
+        block_read_only_research_handoff(issue, reason)
+
+      :github ->
+        complete_github_handoff(workspace, issue, worker_host, handoff_opts)
+    end
+  end
+
+  defp complete_github_handoff(workspace, issue, worker_host, handoff_opts) do
+    github_handoff = Keyword.get(handoff_opts, :github_handoff, &GitHubHandoff.complete/4)
+
+    case github_handoff.(workspace, issue, worker_host, handoff_opts) do
       {:ok, pr_url} ->
         Logger.info("Completed GitHub handoff for #{issue_context(issue)} pr_url=#{pr_url}")
         :ok
@@ -221,6 +237,176 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
     end
   end
+
+  defp research_handoff_route(workspace, %Issue{} = issue, worker_host) do
+    issue_lane = normalize_lane(lane_name(issue))
+
+    case read_phase36_handoff_artifact(workspace, worker_host) do
+      {:ok, %{} = artifact} ->
+        artifact_lane = normalize_lane(Map.get(artifact, "lane") || Map.get(artifact, :lane))
+
+        cond do
+          issue_lane == "research" and artifact_lane != "research" ->
+            {:blocked_research, {:handoff_artifact_lane_mismatch, artifact_lane}}
+
+          issue_lane == "research" or artifact_lane == "research" ->
+            if truthy?(Map.get(artifact, "repo_changed") || Map.get(artifact, :repo_changed)) do
+              :github
+            else
+              {:read_only_research, artifact}
+            end
+
+          true ->
+            :github
+        end
+
+      {:error, reason} ->
+        if issue_lane == "research", do: {:blocked_research, reason}, else: :github
+    end
+  end
+
+  defp complete_read_only_research_handoff(%Issue{} = issue, artifact, opts) do
+    contract = Contract.current()
+    run_state = research_run_state(issue, artifact)
+
+    case {FinalizationGate.evaluate(run_state, contract.review_state, contract), research_artifact_violations(artifact, run_state)} do
+      {{:ok, _gate_result}, []} ->
+        result = Tracker.move_issue_to_state(issue, contract.review_state)
+        record_linear_lifecycle(opts, "linear_move_to_human_review", %{issue_id: issue.id, target_state: contract.review_state}, result)
+        result
+
+      {{:ok, gate_result}, violations} ->
+        block_read_only_research_handoff(issue, {:research_handoff_artifact_invalid, violations, gate_result})
+
+      {{:blocked, gate_result}, _violations} ->
+        block_read_only_research_handoff(issue, {:finalization_gate_blocked, gate_result})
+    end
+  end
+
+  defp block_read_only_research_handoff(%Issue{} = issue, reason) do
+    handoff_result =
+      Tracker.post_handoff_comment(issue, """
+      ## Symphony Research Handoff Blocked
+
+      Symphony stopped this research handoff before Human Review because the read-only research completion contract was not satisfied.
+
+      Reason: #{inspect(reason)}
+      Lane: research
+      """)
+
+    _ = move_issue_to_blocked_after_handoff(issue, "read-only research handoff blocked: #{inspect(reason)}", handoff_result)
+    {:error, {:research_handoff_blocked, reason}}
+  end
+
+  defp research_run_state(%Issue{} = issue, artifact) do
+    validation = Map.get(artifact, "validation") || %{}
+
+    %{
+      lane: "research",
+      current_state: issue.state,
+      available_states: issue.available_states,
+      repo_changed: false,
+      changed_files: [],
+      branch_name: nil,
+      commit_sha: nil,
+      branch_pushed: false,
+      pr_url: nil,
+      pr_created: false,
+      pr_posted_to_linear: false,
+      handoff_posted: research_handoff_comment_posted?(),
+      validation_required: false,
+      validation_status: normalize_validation_status(Map.get(artifact, "validation_status") || Map.get(validation, "status")),
+      validation_reason: Map.get(artifact, "validation_reason") || Map.get(validation, "reason"),
+      findings_posted: truthy?(Map.get(artifact, "findings_posted")),
+      sources_inspected_listed: truthy?(Map.get(artifact, "sources_inspected_listed")),
+      recommendation_included: truthy?(Map.get(artifact, "recommendation_included")),
+      budget_state: :ok
+    }
+  end
+
+  defp research_artifact_violations(artifact, run_state) do
+    [
+      {normalize_lane(Map.get(artifact, "lane") || Map.get(artifact, :lane)) == "research", :research_lane_missing},
+      {Map.get(run_state, :validation_status) == :not_run, :research_validation_status_invalid},
+      {Map.get(run_state, :validation_reason) == "read-only research", :research_validation_reason_invalid},
+      {Map.get(run_state, :handoff_posted) == true, :research_handoff_comment_missing}
+    ]
+    |> Enum.reject(fn {valid?, _code} -> valid? end)
+    |> Enum.map(fn {_valid?, code} -> code end)
+  end
+
+  defp read_phase36_handoff_artifact(workspace, nil) do
+    workspace
+    |> Path.join(@phase36_handoff_path)
+    |> File.read()
+    |> decode_phase36_handoff_artifact()
+  end
+
+  defp read_phase36_handoff_artifact(workspace, worker_host) when is_binary(worker_host) do
+    command = "cd #{shell_escape(workspace)} && cat #{shell_escape(@phase36_handoff_path)}"
+
+    case SSH.run(worker_host, command, stderr_to_stdout: true) do
+      {:ok, output} -> decode_phase36_handoff_artifact({:ok, output})
+      {:error, reason} -> {:error, {:handoff_artifact_read_failed, reason}}
+    end
+  end
+
+  defp decode_phase36_handoff_artifact({:ok, contents}) do
+    case Jason.decode(contents) do
+      {:ok, %{} = artifact} -> {:ok, artifact}
+      {:ok, _other} -> {:error, :handoff_artifact_not_object}
+      {:error, reason} -> {:error, {:handoff_artifact_json_invalid, Exception.message(reason)}}
+    end
+  end
+
+  defp decode_phase36_handoff_artifact({:error, :enoent}), do: {:error, :handoff_artifact_missing}
+  defp decode_phase36_handoff_artifact({:error, reason}), do: {:error, {:handoff_artifact_read_failed, reason}}
+
+  defp record_linear_lifecycle(opts, tool_name, args, :ok) do
+    opts
+    |> Keyword.get(:lifecycle_recorder, fn _event -> :ok end)
+    |> apply_lifecycle_recorder(%{
+      tool_name: tool_name,
+      tool_arguments: args,
+      tool_result: %{success: true}
+    })
+
+    :ok
+  end
+
+  defp record_linear_lifecycle(opts, tool_name, args, {:error, reason} = error) do
+    opts
+    |> Keyword.get(:lifecycle_recorder, fn _event -> :ok end)
+    |> apply_lifecycle_recorder(%{
+      tool_name: tool_name,
+      tool_arguments: args,
+      tool_result: %{success: false, error: inspect(reason)}
+    })
+
+    error
+  end
+
+  defp apply_lifecycle_recorder(recorder, event) when is_function(recorder, 1) do
+    recorder.(event)
+    :ok
+  end
+
+  defp normalize_validation_status(status) when is_atom(status), do: status
+
+  defp normalize_validation_status(status) when is_binary(status) do
+    case status |> String.trim() |> String.downcase() |> String.replace("-", "_") do
+      "passed" -> :passed
+      "failed" -> :failed
+      "allowed_failure" -> :allowed_failure
+      "not_run" -> :not_run
+      _unknown -> nil
+    end
+  end
+
+  defp normalize_validation_status(_status), do: nil
+
+  defp truthy?(value) when value in [true, "true", "yes", "1", 1], do: true
+  defp truthy?(_value), do: false
 
   defp block_issue_for_max_turns(issue, max_turns) do
     handoff_result =
@@ -257,6 +443,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp lane_name(%Issue{lane_classification: %{lane: lane}}), do: lane
   defp lane_name(_issue), do: "unknown"
+
+  defp normalize_lane(lane) when is_atom(lane), do: lane |> Atom.to_string() |> normalize_lane()
+
+  defp normalize_lane(lane) when is_binary(lane) do
+    lane
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_lane(_lane), do: ""
 
   defp lifecycle_recorder(recipient, %Issue{id: issue_id}) when is_binary(issue_id) and is_pid(recipient) do
     fn lifecycle_event ->
@@ -307,9 +503,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp reset_handoff_ready do
     Process.put({__MODULE__, :handoff_ready}, false)
+    Process.put({__MODULE__, :research_handoff_comment_posted}, false)
   end
 
   defp record_handoff_ready(message, issue) do
+    if research_handoff_comment_message?(message, issue) do
+      Process.put({__MODULE__, :research_handoff_comment_posted}, true)
+    end
+
     if handoff_ready_message?(message) or research_linear_handoff_complete?(message, issue) do
       Process.put({__MODULE__, :handoff_ready}, true)
     end
@@ -317,6 +518,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp handoff_ready? do
     Process.get({__MODULE__, :handoff_ready}, false) == true
+  end
+
+  defp research_handoff_comment_posted? do
+    Process.get({__MODULE__, :research_handoff_comment_posted}, false) == true
   end
 
   defp handoff_ready_message?(message) when is_binary(message),
@@ -339,6 +544,33 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp research_linear_handoff_complete?(_message, _issue), do: false
+
+  defp research_handoff_comment_message?(message, %Issue{lane_classification: %{lane: lane}})
+       when lane in [:research, "research"] do
+    linear_handoff_success_message?(message)
+  end
+
+  defp research_handoff_comment_message?(_message, _issue), do: false
+
+  defp linear_handoff_success_message?(%{event: event} = message)
+       when event in [:tool_call_completed, :linear_lifecycle_call] do
+    tool_name = Map.get(message, :tool_name) || Map.get(message, "tool_name")
+    result = Map.get(message, :tool_result) || Map.get(message, "tool_result") || %{}
+
+    tool_name == "linear_post_handoff" and tool_result_success?(result)
+  end
+
+  defp linear_handoff_success_message?(%_{}), do: false
+
+  defp linear_handoff_success_message?(message) when is_map(message) do
+    Enum.any?(message, fn {_key, value} -> linear_handoff_success_message?(value) end)
+  end
+
+  defp linear_handoff_success_message?(message) when is_list(message) do
+    Enum.any?(message, &linear_handoff_success_message?/1)
+  end
+
+  defp linear_handoff_success_message?(_message), do: false
 
   defp linear_human_review_success_message?(%{event: event} = message)
        when event in [:tool_call_completed, :linear_lifecycle_call] do
@@ -391,6 +623,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name

@@ -5,6 +5,35 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
   alias SymphonyElixir.{GitHubHandoff, JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
   alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate}
 
+  defmodule HandoffCommentIdLinearClient do
+    def fetch_candidate_issues, do: {:ok, []}
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(query, variables) do
+      case Application.get_env(:symphony_elixir, :linear_client_recipient) do
+        pid when is_pid(pid) -> send(pid, {:linear_client_graphql, query, variables})
+        _ -> :ok
+      end
+
+      cond do
+        String.contains?(query, "commentCreate") ->
+          {:ok,
+           %{
+             "data" => %{
+               "commentCreate" => %{
+                 "success" => true,
+                 "comment" => %{"id" => "comment-249"}
+               }
+             }
+           }}
+
+        String.contains?(query, "issueUpdate") ->
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+    end
+  end
+
   @contract %Contract{}
   @states [
     %{name: "In Progress", id: "state-progress"},
@@ -77,6 +106,142 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert classification.lane == :test
 
       assert_handoff_reaches_human_review(%{issue | lane_classification: classification})
+    end
+  end
+
+  describe "research read-only handoff routing" do
+    test "valid read-only research handoff finalizes through Linear without GitHub PR handoff" do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-research-linear-only-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        codex_binary = Path.join(test_root, "fake-codex")
+        trace_file = Path.join(test_root, "codex.trace")
+
+        File.mkdir_p!(workspace_root)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+        count=0
+
+        while IFS= read -r line; do
+          count=$((count + 1))
+          printf 'JSON:%s\\n' "$line" >> "$trace_file"
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-research-ready"}}}'
+              ;;
+            4)
+              mkdir -p .phase36
+              cat > .phase36/handoff.json <<'JSON'
+        {
+          "lane": "research",
+          "linear_issue_identifier": "AGE-26",
+          "status": "handoff_ready",
+          "repo_changed": false,
+          "branch_name": null,
+          "commit_sha": null,
+          "pr_url": null,
+          "changed_files": [],
+          "findings_posted": true,
+          "sources_inspected_listed": true,
+          "recommendation_included": true,
+          "validation_status": "not_run",
+          "validation_reason": "read-only research",
+          "validation": {
+            "required": false,
+            "status": "not_run",
+            "command": "not required",
+            "reason": "read-only research"
+          },
+          "handoff": {
+            "linear_comment_posted": true,
+            "final_state_requested": "Human Review"
+          },
+          "protocol_notes": ["Findings posted to Linear handoff comment."]
+        }
+        JSON
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research-ready"}}}'
+              printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research-ready","turnId":"turn-research-ready","arguments":{"issue_id":"issue-research-ready","body":"Findings: docs are clear. Sources: README.md. Recommendation: no repo change."}}}'
+              ;;
+            5)
+              printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+        System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+        on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          tracker_kind: "linear",
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          max_turns: 3
+        )
+
+        Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+        Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+        on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
+        issue = %Issue{
+          id: "issue-research-ready",
+          identifier: "AGE-26",
+          title: "Investigate read-only handoff routing",
+          description: "Read-only research. Post findings in Linear. No repository changes.",
+          state: "In Progress",
+          labels: ["research"],
+          lane_classification: %{
+            lane: :research,
+            reason: "explicit research lane",
+            matched_signals: ["label:research"],
+            policy_version: "2026-05-10.phase3"
+          },
+          available_states: [%{id: "state-human-review", name: "Human Review"}]
+        }
+
+        assert :ok =
+                 AgentRunner.run(issue, self(),
+                   linear_lifecycle_graphql: &HandoffCommentIdLinearClient.graphql/2,
+                   github_handoff: fn _workspace, _issue, _worker_host, _opts ->
+                     flunk("GitHubHandoff must not run for read-only research")
+                   end,
+                   issue_state_fetcher: fn _issue_ids ->
+                     flunk("research handoff marker should finalize without polling another turn")
+                   end
+                 )
+
+        assert_receive {:linear_client_graphql, comment_query, %{issueId: "issue-research-ready", body: comment}}
+        assert comment_query =~ "commentCreate"
+        assert comment =~ "Findings:"
+        assert comment =~ "Sources:"
+        assert comment =~ "Recommendation:"
+
+        assert_receive {:linear_client_graphql, update_query, %{issueId: "issue-research-ready", stateId: "state-human-review"}}
+        assert update_query =~ "issueUpdate"
+
+        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :tool_call_completed, tool_name: "linear_post_handoff", tool_result: %{"success" => true}}}
+        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :linear_lifecycle_call, tool_name: "linear_move_to_human_review", tool_result: %{success: true}}}
+
+        trace = File.read!(trace_file)
+        refute trace =~ "No commits between"
+      after
+        File.rm_rf(test_root)
+      end
     end
   end
 
