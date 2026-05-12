@@ -300,6 +300,76 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert output["error"]["code"] == "finalization_gate_blocked"
       assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "pr_required_but_missing"))
     end
+
+    test "research narrow Human Review lifecycle tool cannot bypass research evidence" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+
+      issue =
+        %Issue{
+          id: "issue-research-tool-gate",
+          state: "In Progress",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{
+            "issue_id" => "issue-research-tool-gate",
+            "repo_changed" => false,
+            "lane" => "research",
+            "findings_posted" => true,
+            "sources_inspected_listed" => true,
+            "recommendation_included" => true,
+            "validation_status" => "not_run",
+            "validation_reason" => "read-only research"
+          },
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn _query, _variables ->
+            flunk("Linear state mutation should not run without the research handoff artifact")
+          end
+        )
+
+      assert response["success"] == false
+      output = Jason.decode!(response["output"])
+      assert output["error"]["code"] == "finalization_gate_blocked"
+      assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "research_findings_missing"))
+    end
+
+    test "research handoff artifact fields are extracted into narrow Human Review gate state" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+      write_research_handoff_artifact!(workspace)
+      test_pid = self()
+
+      issue =
+        %Issue{
+          id: "issue-research-artifact-gate",
+          state: "In Progress",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{"issue_id" => "issue-research-artifact-gate", "lane" => "research"},
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn query, variables ->
+            send(test_pid, {:linear_lifecycle_graphql_called, query, variables})
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        )
+
+      assert_received {:linear_lifecycle_graphql_called, query, %{issueId: "issue-research-artifact-gate", stateId: "state-review"}}
+      assert query =~ "issueUpdate"
+      assert response["success"] == true
+      assert Jason.decode!(response["output"])["state"] == "Human Review"
+    end
   end
 
   describe "Layer B dry-run orchestration simulations" do
@@ -407,6 +477,49 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       budget_state: :ok
     }
     |> Map.merge(overrides)
+  end
+
+  defp temp_workspace! do
+    workspace = Path.join(System.tmp_dir!(), "symphony-phase36-research-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    workspace
+  end
+
+  defp write_research_handoff_artifact!(workspace) do
+    File.mkdir_p!(Path.join(workspace, ".phase36"))
+
+    File.write!(
+      Path.join(workspace, ".phase36/handoff.json"),
+      Jason.encode!(
+        %{
+          "lane" => "research",
+          "linear_issue_identifier" => "AGE-24",
+          "status" => "handoff_ready",
+          "repo_changed" => false,
+          "branch_name" => nil,
+          "commit_sha" => nil,
+          "pr_url" => nil,
+          "changed_files" => [],
+          "findings_posted" => true,
+          "sources_inspected_listed" => true,
+          "recommendation_included" => true,
+          "validation_status" => "not_run",
+          "validation_reason" => "read-only research",
+          "validation" => %{
+            "required" => false,
+            "status" => "not_run",
+            "command" => "not required",
+            "reason" => "read-only research"
+          },
+          "handoff" => %{
+            "linear_comment_posted" => true,
+            "final_state_requested" => "Human Review"
+          },
+          "protocol_notes" => ["Findings posted to Linear handoff comment."]
+        },
+        pretty: true
+      )
+    )
   end
 
   defp handoff_issue(overrides) do

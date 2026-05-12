@@ -59,7 +59,7 @@ defmodule SymphonyElixir.JobPacket do
     - Keep tool use within the tool-call budget. Generic `linear_graphql` is fallback/debug only and abnormal.
     - At 80% of the effective token budget, compress your working context and finish only if still likely.
     - If the hard effective token or tool-call budget is exceeded, stop optional investigation and report a concise blocker.
-    - For research lane, stay read-only unless the ticket explicitly asks for repository changes; post findings with the narrow Linear handoff/comment path and move to Human Review.
+    - For research lane, stay read-only unless the ticket explicitly asks for repository changes; write `.phase36/handoff.json` with findings/sources/recommendation evidence, post findings with the narrow Linear handoff/comment path, and move to Human Review.
     - Include `SYMPHONY_HANDOFF_READY` only when repository work is complete, committed, pushed, and validated.
     """
   end
@@ -76,7 +76,7 @@ defmodule SymphonyElixir.JobPacket do
   defp pr_policy(_policy), do: "not required unless repository files changed"
 
   defp completion_policy(%{lane: :research}) do
-    "Default read-only completion: post concise findings through `linear_post_handoff`, then move the issue to Human Review with `linear_move_to_human_review`. Do not create a branch, commit, PR, or emit `SYMPHONY_HANDOFF_READY` unless repository files changed."
+    "Default read-only completion: write `.phase36/handoff.json` with lane=research, findings_posted=true, sources_inspected_listed=true, recommendation_included=true, validation_status=not_run, and validation_reason=read-only research; post concise findings through `linear_post_handoff`; then move the issue to Human Review with `linear_move_to_human_review`. Do not create a branch, commit, PR, or emit `SYMPHONY_HANDOFF_READY` unless repository files changed."
   end
 
   defp completion_policy(%{pr_required: true}) do

@@ -1136,13 +1136,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
     repo_changed = repo_changed?(artifact_repo_changed, product_changed_files, pr_url)
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
-    expected_final_state = expected_final_state(runner_result, final_state)
-    external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, product_changed_files, expected_final_state, deps)
+    preliminary_expected_final_state = expected_final_state(runner_result, final_state)
 
     gate_result =
       %{
         lane: lane,
-        current_state: expected_final_state,
+        current_state: preliminary_expected_final_state,
         available_states: issue.available_states,
         repo_changed: repo_changed,
         changed_files: product_changed_files,
@@ -1164,6 +1163,9 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       |> Map.merge(artifact_gate_evidence(artifact_result, telemetry))
       |> finalization_gate_result()
 
+    expected_final_state = expected_final_state(runner_result, final_state, gate_result)
+    external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, product_changed_files, expected_final_state, deps)
+
     evidence =
       %{
         "linear_issue_identifier" => issue.identifier,
@@ -1182,6 +1184,9 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "validation_command_result" => Map.get(validation, "command_result"),
         "validation_command" => Map.get(validation, "command"),
         "validation_reason" => Map.get(validation, "reason"),
+        "findings_posted" => findings_posted?(lane, artifact_result, comments),
+        "sources_inspected_listed" => artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected_listed"),
+        "recommendation_included" => artifact_or_telemetry_value(artifact_result, telemetry, "recommendation_included"),
         "targeted_tests_run" => artifact_or_telemetry_value(artifact_result, telemetry, "targeted_tests_run"),
         "test_coverage_added" => artifact_or_telemetry_value(artifact_result, telemetry, "test_coverage_added"),
         "repo_changed" => repo_changed,
@@ -1241,6 +1246,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       _ -> final_state
     end
   end
+
+  defp expected_final_state(_runner_result, final_state, %{"result" => "blocked"}) do
+    expected_final_state({:error, :finalization_gate_blocked}, final_state)
+  end
+
+  defp expected_final_state(runner_result, final_state, _gate_result), do: expected_final_state(runner_result, final_state)
 
   defp finalization_gate_result(run_state) do
     contract = Contract.current()
@@ -1382,7 +1393,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       |> lane_mismatch_violations(artifact, lane, issue)
       |> repo_change_violations(lane, artifact, observed_changed_files)
       |> docs_validation_violations(lane, validation)
-      |> research_artifact_violations(lane, repo_changed, handoff, protocol_notes)
+      |> research_artifact_violations(lane, repo_changed, handoff, protocol_notes, artifact)
       |> lane_validation_violations(lane, validation)
       |> test_artifact_violations(lane, artifact, validation)
 
@@ -1448,14 +1459,39 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     )
   end
 
-  defp research_artifact_violations(violations, lane, repo_changed, handoff, protocol_notes) do
-    maybe_add_violation(
-      violations,
-      lane == "research" and not repo_changed and (not truthy?(Map.get(handoff, "linear_comment_posted")) or protocol_notes == []),
+  defp research_artifact_violations(violations, "research", false, handoff, protocol_notes, artifact) do
+    validation = Map.get(artifact || %{}, "validation") || %{}
+
+    violations
+    |> maybe_add_violation(
+      not truthy?(Map.get(handoff, "linear_comment_posted")) or protocol_notes == [],
       "research_findings_evidence_required",
       "Read-only research artifacts must include findings evidence in protocol_notes and confirm the Linear comment was posted."
     )
+    |> maybe_add_violation(not truthy?(Map.get(artifact || %{}, "findings_posted")), "research_findings_missing", "Read-only research artifacts must record findings_posted=true.")
+    |> maybe_add_violation(
+      not truthy?(Map.get(artifact || %{}, "sources_inspected_listed")),
+      "research_sources_missing",
+      "Read-only research artifacts must record sources_inspected_listed=true."
+    )
+    |> maybe_add_violation(
+      not truthy?(Map.get(artifact || %{}, "recommendation_included")),
+      "research_conclusion_missing",
+      "Read-only research artifacts must record recommendation_included=true."
+    )
+    |> maybe_add_violation(
+      first_present([Map.get(artifact || %{}, "validation_status"), Map.get(validation, "status")]) != "not_run",
+      "research_validation_status_invalid",
+      "Read-only research artifacts must record validation_status=not_run."
+    )
+    |> maybe_add_violation(
+      first_present([Map.get(artifact || %{}, "validation_reason"), Map.get(validation, "reason")]) != "read-only research",
+      "research_validation_reason_invalid",
+      "Read-only research artifacts must record validation_reason=read-only research."
+    )
   end
+
+  defp research_artifact_violations(violations, _lane, _repo_changed, _handoff, _protocol_notes, _artifact), do: violations
 
   defp lane_validation_violations(violations, lane, validation) do
     status = validation_status(validation)
@@ -1713,9 +1749,9 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "Lane completion signal SYMPHONY_HANDOFF_READY was not observed."
     )
     |> maybe_add_completion_violation(
-      repo_changing_lane?(lane) and Map.get(evidence, "handoff_artifact_valid") != true,
+      (repo_changing_lane?(lane) or lane == "research") and Map.get(evidence, "handoff_artifact_valid") != true,
       "lane_contract_handoff_artifact_failed",
-      "Repo-changing Phase 3.6 lanes require a valid .phase36/handoff.json artifact."
+      "Phase 3.6 repo-changing and research lanes require a valid .phase36/handoff.json artifact."
     )
     |> maybe_add_completion_violation(
       repo_changing_lane?(lane) and not non_empty_list?(Map.get(evidence, "product_changed_files")),
@@ -2178,7 +2214,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     Make the requested lane-scoped edit only.
     Do not create a second clone or work from `/tmp` for repository changes.
     Before emitting `SYMPHONY_HANDOFF_READY`, write `.phase36/handoff.json` in the managed workspace.
-    For repo-changing lanes, this artifact is the pre-handoff contract: keep every required key present, use `null` only for branch/commit/PR values that Symphony finalizes after `SYMPHONY_HANDOFF_READY`, and explain those provisional values in `protocol_notes`.
+    For repo-changing and research lanes, this artifact is the pre-handoff contract: keep every required key present, use `null` only for branch/commit/PR values that Symphony finalizes after `SYMPHONY_HANDOFF_READY` or that are intentionally absent for read-only research, and explain those provisional values in `protocol_notes`.
     The handoff artifact must be valid JSON and include:
     - `lane`
     - `linear_issue_identifier`
@@ -2201,6 +2237,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     - `validation_command`: exact command that was run
     - `validation_status`: `passed`, `failed`, or `not_run`
     - `validation_reason`: short evidence summary
+    For `research` lane artifacts, also include explicit top-level evidence fields:
+    - `findings_posted`: `true` only when findings were posted to Linear
+    - `sources_inspected_listed`: `true` only when inspected sources are listed
+    - `recommendation_included`: `true` only when a recommendation or conclusion is included
+    - `validation_status`: `not_run`
+    - `validation_reason`: `read-only research`
     Do not emit `SYMPHONY_HANDOFF_READY` until the file exists and reflects the final handoff state.
     """
   end

@@ -87,6 +87,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
         DynamicTool.execute(tool, arguments,
           issue: issue,
+          workspace: workspace,
           linear_lifecycle_graphql: Keyword.get(opts, :linear_lifecycle_graphql)
         )
       end)

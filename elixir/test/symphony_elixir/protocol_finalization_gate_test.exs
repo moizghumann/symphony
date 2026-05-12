@@ -243,6 +243,54 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert result.pr_required == false
   end
 
+  test "research lane blocks when findings evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        sources_inspected_listed: true,
+        recommendation_included: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_findings_missing)
+  end
+
+  test "research lane blocks when inspected sources are missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        findings_posted: true,
+        recommendation_included: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_sources_missing)
+  end
+
+  test "research lane blocks when recommendation is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        findings_posted: true,
+        sources_inspected_listed: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_conclusion_missing)
+  end
+
   test "research lane with committed markdown artifact and PR can move to Human Review" do
     run_state =
       base_run_state(%{

@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @linear_post_handoff_tool "linear_post_handoff"
   @linear_post_blocker_tool "linear_post_blocker"
   @linear_attach_pr_tool "linear_attach_pr"
+  @phase36_handoff_path ".phase36/handoff.json"
   @linear_narrow_tools [
     @linear_move_state_tool,
     @linear_move_to_in_progress_tool,
@@ -300,7 +301,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     contract = protocol_contract(opts)
 
     if target_state in [contract.review_state, contract.blocked_state, contract.done_state] do
-      run_state = finalization_run_state(issue, args, target_state, contract)
+      run_state = finalization_run_state(issue, args, target_state, contract, opts)
 
       case FinalizationGate.evaluate(run_state, target_state, contract) do
         {:ok, _result} -> :ok
@@ -318,7 +319,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp finalization_run_state(%Issue{} = issue, args, target_state, %Contract{} = contract) do
+  defp finalization_run_state(%Issue{} = issue, args, target_state, %Contract{} = contract, opts) do
     %{
       current_state: issue.state,
       available_states: issue.available_states,
@@ -341,7 +342,99 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       merged: arg(args, "merged"),
       ticket_text: arg(args, "ticket_text", issue.description)
     }
+    |> merge_research_handoff_artifact(issue, target_state, contract, opts)
   end
+
+  defp merge_research_handoff_artifact(run_state, issue, target_state, %Contract{} = contract, opts) do
+    if research_lane?(issue, run_state) and target_state == contract.review_state and Keyword.has_key?(opts, :workspace) do
+      case read_phase36_handoff_artifact(Keyword.get(opts, :workspace)) do
+        {:ok, %{} = artifact} ->
+          if valid_research_handoff_artifact?(artifact) do
+            research_artifact_run_state(run_state, artifact)
+          else
+            missing_research_artifact_run_state(run_state)
+          end
+
+        :error ->
+          missing_research_artifact_run_state(run_state)
+      end
+    else
+      run_state
+    end
+  end
+
+  defp research_lane?(%Issue{} = issue, run_state) do
+    (Map.get(run_state, :lane) || issue_lane(issue)) == "research"
+  end
+
+  defp read_phase36_handoff_artifact(workspace) when is_binary(workspace) do
+    path = Path.join(workspace, @phase36_handoff_path)
+
+    with true <- File.regular?(path),
+         {:ok, body} <- File.read(path),
+         {:ok, %{} = artifact} <- Jason.decode(body) do
+      {:ok, artifact}
+    else
+      _ -> :error
+    end
+  end
+
+  defp read_phase36_handoff_artifact(_workspace), do: :error
+
+  defp valid_research_handoff_artifact?(%{} = artifact) do
+    validation = Map.get(artifact, "validation") || %{}
+
+    artifact_value(artifact, "lane") == "research" and
+      truthy?(artifact_value(artifact, "findings_posted")) and
+      truthy?(artifact_value(artifact, "sources_inspected_listed")) and
+      truthy?(artifact_value(artifact, "recommendation_included")) and
+      first_present([artifact_value(artifact, "validation_status"), artifact_value(validation, "status")]) == "not_run" and
+      first_present([artifact_value(artifact, "validation_reason"), artifact_value(validation, "reason")]) == "read-only research"
+  end
+
+  defp valid_research_handoff_artifact?(_artifact), do: false
+
+  defp missing_research_artifact_run_state(run_state) do
+    Map.merge(run_state, %{
+      findings_posted: nil,
+      sources_inspected_listed: nil,
+      recommendation_included: nil,
+      validation_status: :not_run,
+      validation_reason: nil
+    })
+  end
+
+  defp research_artifact_run_state(run_state, artifact) do
+    validation = Map.get(artifact, "validation") || %{}
+    handoff = Map.get(artifact, "handoff") || %{}
+
+    Map.merge(run_state, %{
+      lane: artifact_value(artifact, "lane", Map.get(run_state, :lane)),
+      repo_changed: artifact_value(artifact, "repo_changed", Map.get(run_state, :repo_changed)),
+      changed_files: artifact_value(artifact, "changed_files", Map.get(run_state, :changed_files)),
+      validation_required: artifact_value(validation, "required", Map.get(run_state, :validation_required)),
+      validation_status: first_present([artifact_value(artifact, "validation_status"), artifact_value(validation, "status"), Map.get(run_state, :validation_status)]),
+      validation_reason: first_present([artifact_value(artifact, "validation_reason"), artifact_value(validation, "reason"), Map.get(run_state, :validation_reason)]),
+      findings_posted: artifact_value(artifact, "findings_posted"),
+      sources_inspected_listed: artifact_value(artifact, "sources_inspected_listed"),
+      recommendation_included: artifact_value(artifact, "recommendation_included"),
+      handoff_posted: truthy?(artifact_value(handoff, "linear_comment_posted")) || Map.get(run_state, :handoff_posted)
+    })
+  end
+
+  defp artifact_value(artifact, key, default \\ nil)
+  defp artifact_value(%{} = artifact, key, default), do: Map.get(artifact, key, default)
+  defp artifact_value(_artifact, _key, default), do: default
+
+  defp first_present(values) do
+    Enum.find(values, fn
+      nil -> false
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> true
+    end)
+  end
+
+  defp truthy?(value), do: value in [true, "true", 1, "1"]
 
   defp default_repo_changed(target_state, args, %Contract{} = contract) do
     if Map.has_key?(args, "repo_changed") or Map.has_key?(args, :repo_changed) do

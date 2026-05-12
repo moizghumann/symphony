@@ -684,7 +684,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
                   "required" => false,
                   "status" => "not_run",
                   "command" => "not required",
-                  "reason" => "read-only research lane"
+                  "reason" => "read-only research"
                 },
                 "handoff" => %{
                   "linear_comment_posted" => true,
@@ -705,7 +705,51 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["handoff_artifact_valid"] == true
     assert lane_result["finalization_gate_result"] == "ok"
     assert lane_result["repo_changed"] == false
+    assert lane_result["findings_posted"] == true
+    assert lane_result["sources_inspected_listed"] == true
+    assert lane_result["recommendation_included"] == true
+    assert lane_result["validation_status"] == "not_run"
+    assert lane_result["validation_reason"] == "read-only research"
     refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_evidence_required"))
+
+    File.rm(output_path)
+  end
+
+  test "blocked research external verification expects Blocked when handoff artifact is missing" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        linear_verify: fn _issue, _artifact, _snapshot, context ->
+          assert Map.fetch!(context, :expected_final_state) == "Blocked"
+
+          {:ok,
+           %{
+             "final_state" => "Blocked",
+             "handoff_comment_exists" => false,
+             "blocker_comment_exists" => true,
+             "pr_url_posted" => false,
+             "research_findings_posted" => false
+           }}
+        end,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, :missing, %{"changed_files" => []})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["expected_final_state"] == "Blocked"
+    assert lane_result["external_verification"]["linear"]["final_state"] == "Blocked"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_missing"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_contract_handoff_artifact_failed"))
 
     File.rm(output_path)
   end
@@ -1025,8 +1069,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
         github_preflight: fn -> :ok end,
         linear_graphql: &fake_linear_graphql/2,
         run_agent: fn _issue, _preflight, _output_path ->
-          {:error,
-           {:before_codex_start_failed, "active_workspace_git_root_not_writable"},
+          {:error, {:before_codex_start_failed, "active_workspace_git_root_not_writable"},
            %{
              "workspace_path" => workspace_path,
              "active_workspace_path" => workspace_path,
@@ -1290,7 +1333,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
   defp default_validation_command(_lane), do: "cd elixir && mise exec -- mix test test/mix/tasks/phase36_live_smoke_test.exs"
 
   defp default_validation_reason("docs"), do: "docs-only change"
-  defp default_validation_reason("research"), do: "read-only research lane"
+  defp default_validation_reason("research"), do: "read-only research"
   defp default_validation_reason(_lane), do: nil
 
   defp default_final_state("research"), do: "Human Review"
@@ -1308,7 +1351,9 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     %{
       "findings_posted" => true,
       "sources_inspected_listed" => true,
-      "recommendation_included" => true
+      "recommendation_included" => true,
+      "validation_status" => "not_run",
+      "validation_reason" => "read-only research"
     }
   end
 
