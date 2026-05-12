@@ -310,6 +310,31 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
     end
   end
 
+  describe "Layer C live-smoke evidence" do
+    test "blocked preflight evidence remains partial and records no live mutation artifacts" do
+      evidence = File.read!(phase36_validation_evidence_path())
+
+      assert phase36_validation_summary(evidence) == "partial"
+
+      assert live_smoke_matrix_rows(evidence) == [
+               {"docs", "not run", "partial"},
+               {"bug", "not run", "partial"},
+               {"feature", "not run", "partial"},
+               {"refactor", "not run", "partial"},
+               {"test", "not run", "partial"},
+               {"chore", "not run", "partial"},
+               {"research", "not run", "partial"}
+             ]
+
+      assert evidence =~ "real smoke tests attempted but not run to mutation"
+      assert evidence =~ "`gh auth status` failed because `GH_TOKEN` is invalid"
+      assert evidence =~ "No Linear issue, Git branch, commit, push, or GitHub PR was created by live smoke."
+      assert evidence =~ "Do not mark Phase 3.6 fully passed until real smoke tests run."
+
+      refute evidence =~ ~r/^\| (docs|bug|feature|refactor|test|chore|research) \| pass \| pass \| pass \| pass \|$/m
+    end
+  end
+
   defp simulate(title, description, artifacts) do
     issue = %Issue{id: "issue-#{System.unique_integer([:positive])}", title: title, description: description, state: "In Progress", labels: []}
     classification = LaneClassifier.classify(issue)
@@ -548,6 +573,25 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       sources_inspected_listed: true,
       recommendation_included: true
     }
+  end
+
+  defp phase36_validation_evidence_path do
+    Path.expand("../../../docs/validation/phase-3-6-orchestration-validation.md", __DIR__)
+  end
+
+  defp phase36_validation_summary(evidence) do
+    case Regex.run(~r/^## Summary\n\n(?<summary>[^\n]+)/m, evidence, capture: ["summary"]) do
+      [summary] -> String.trim(summary)
+      _ -> nil
+    end
+  end
+
+  defp live_smoke_matrix_rows(evidence) do
+    ~r/^\| (docs|bug|feature|refactor|test|chore|research) \| pass \| pass \| ([^|]+) \| ([^|]+) \|$/m
+    |> Regex.scan(evidence)
+    |> Enum.map(fn [_row, lane, real_smoke, result] ->
+      {lane, String.trim(real_smoke), String.trim(result)}
+    end)
   end
 
   defp violation?(result, code), do: Enum.any?(result.protocol_violations, &(&1.code == code))
