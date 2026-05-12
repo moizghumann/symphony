@@ -662,12 +662,18 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
   test "accepts a research read-only artifact" do
     output_path = temp_output_path()
+    parent = self()
 
     deps =
       inert_deps(%{
         getenv: selector_env("research"),
         github_preflight: fn -> :ok end,
         linear_graphql: &fake_linear_graphql/2,
+        move_issue_to_state: fn issue, state ->
+          send(parent, {:moved_issue, issue.identifier, state})
+          Process.put({__MODULE__, :phase36_issue_state}, state_payload(state))
+          :ok
+        end,
         run_agent: fn issue, _preflight, _output_path ->
           {:ok,
            artifact_runner_result(
@@ -704,6 +710,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     [lane_result] = evidence["results"]
     assert lane_result["handoff_artifact_valid"] == true
     assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["expected_final_state"] == "Human Review"
     assert lane_result["repo_changed"] == false
     assert lane_result["findings_posted"] == true
     assert lane_result["sources_inspected_listed"] == true
@@ -711,18 +718,26 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["validation_status"] == "not_run"
     assert lane_result["validation_reason"] == "read-only research"
     refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_evidence_required"))
+    assert_received {:moved_issue, "AWB-123", "In Progress"}
+    refute_received {:moved_issue, "AWB-123", "Blocked"}
 
     File.rm(output_path)
   end
 
   test "blocked research external verification expects Blocked when handoff artifact is missing" do
     output_path = temp_output_path()
+    parent = self()
 
     deps =
       inert_deps(%{
         getenv: selector_env("research"),
         github_preflight: fn -> :ok end,
         linear_graphql: &fake_linear_graphql/2,
+        move_issue_to_state: fn issue, state ->
+          send(parent, {:moved_issue, issue.identifier, state})
+          Process.put({__MODULE__, :phase36_issue_state}, state_payload(state))
+          :ok
+        end,
         linear_verify: fn _issue, _artifact, _snapshot, context ->
           assert Map.fetch!(context, :expected_final_state) == "Blocked"
 
@@ -750,6 +765,9 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["finalization_gate_result"] == "blocked"
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_missing"))
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_contract_handoff_artifact_failed"))
+    assert_received {:moved_issue, "AWB-123", "In Progress"}
+    assert_received {:moved_issue, "AWB-123", "Blocked"}
+    refute_received {:moved_issue, "AWB-123", "Human Review"}
 
     File.rm(output_path)
   end

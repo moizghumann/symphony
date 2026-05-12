@@ -2287,6 +2287,35 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research"}}}'
+            mkdir -p .phase36
+            cat > .phase36/handoff.json <<'JSON'
+            {
+              "lane": "research",
+              "linear_issue_identifier": "MT-RESEARCH",
+              "status": "handoff_ready",
+              "repo_changed": false,
+              "branch_name": null,
+              "commit_sha": null,
+              "pr_url": null,
+              "changed_files": [],
+              "findings_posted": true,
+              "sources_inspected_listed": true,
+              "recommendation_included": true,
+              "validation_status": "not_run",
+              "validation_reason": "read-only research",
+              "validation": {
+                "required": false,
+                "status": "not_run",
+                "command": "not required",
+                "reason": "read-only research"
+              },
+              "handoff": {
+                "linear_comment_posted": true,
+                "final_state_requested": "Human Review"
+              },
+              "protocol_notes": ["Findings posted to Linear handoff comment."]
+            }
+            JSON
             printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff","body":"README onboarding is clear; no repo changes needed."}}}'
             ;;
           5)

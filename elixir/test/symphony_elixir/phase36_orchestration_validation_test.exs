@@ -370,6 +370,36 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert response["success"] == true
       assert Jason.decode!(response["output"])["state"] == "Human Review"
     end
+
+    test "research Human Review lifecycle tool does not attempt Blocked to Human Review" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+      write_research_handoff_artifact!(workspace)
+
+      issue =
+        %Issue{
+          id: "issue-research-blocked",
+          state: "Blocked",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{"issue_id" => "issue-research-blocked", "lane" => "research"},
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn _query, _variables ->
+            flunk("Linear state mutation should not run for Blocked -> Human Review")
+          end
+        )
+
+      assert response["success"] == false
+      output = Jason.decode!(response["output"])
+      assert output["error"]["code"] == "finalization_gate_blocked"
+      assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "illegal_state_transition"))
+    end
   end
 
   describe "Layer B dry-run orchestration simulations" do

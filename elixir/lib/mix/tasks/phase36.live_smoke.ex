@@ -1136,12 +1136,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
     repo_changed = repo_changed?(artifact_repo_changed, product_changed_files, pr_url)
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
-    preliminary_expected_final_state = expected_final_state(runner_result, final_state)
 
     gate_result =
       %{
         lane: lane,
-        current_state: preliminary_expected_final_state,
+        current_state: issue.state,
         available_states: issue.available_states,
         repo_changed: repo_changed,
         changed_files: product_changed_files,
@@ -1163,7 +1162,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       |> Map.merge(artifact_gate_evidence(artifact_result, telemetry))
       |> finalization_gate_result()
 
-    expected_final_state = expected_final_state(runner_result, final_state, gate_result)
+    expected_final_state = expected_final_state(lane, runner_result, final_state, gate_result)
     external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, product_changed_files, expected_final_state, deps)
 
     evidence =
@@ -1247,11 +1246,15 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     end
   end
 
-  defp expected_final_state(_runner_result, final_state, %{"result" => "blocked"}) do
+  defp expected_final_state(lane, _runner_result, final_state, %{"result" => "ok"}) when lane == "research" do
+    final_state
+  end
+
+  defp expected_final_state(_lane, _runner_result, final_state, %{"result" => "blocked"}) do
     expected_final_state({:error, :finalization_gate_blocked}, final_state)
   end
 
-  defp expected_final_state(runner_result, final_state, _gate_result), do: expected_final_state(runner_result, final_state)
+  defp expected_final_state(_lane, runner_result, final_state, _gate_result), do: expected_final_state(runner_result, final_state)
 
   defp finalization_gate_result(run_state) do
     contract = Contract.current()
