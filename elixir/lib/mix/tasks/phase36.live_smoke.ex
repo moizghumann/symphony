@@ -910,6 +910,36 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     end
   end
 
+  defp block_completion_contract_issue(issue, blocker_reason, completion_states, deps) do
+    body = """
+    ## Symphony Handoff Blocked
+
+    Phase 3.6 live smoke could not verify the AgentRunner completion contract.
+
+    Issue: #{issue.identifier || issue.id}
+    Reason: #{blocker_reason}
+
+    Completion states:
+    - codex_process_started: #{completion_states["codex_process_started"]}
+    - codex_prompt_delivered: #{completion_states["codex_prompt_delivered"]}
+    - codex_work_observed: #{completion_states["codex_work_observed"]}
+    - symphony_handoff_ready_seen: #{completion_states["symphony_handoff_ready_seen"]}
+    - lane_contract_satisfied: #{completion_states["lane_contract_satisfied"]}
+    """
+
+    handoff_result = deps.post_handoff_comment.(issue, body)
+
+    if handoff_result == :ok do
+      case deps.move_issue_to_state.(issue, Contract.current().blocked_state) do
+        :ok -> %{"status" => "blocked", "handoff_posted" => true}
+        {:error, reason} -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(reason)}
+        other -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(other)}
+      end
+    else
+      %{"status" => "handoff_failed", "handoff_posted" => false, "reason" => inspect(handoff_result)}
+    end
+  end
+
   defp start_issue!(issue, preflight, deps) do
     case deps.move_issue_to_state.(issue, "In Progress") do
       :ok ->
@@ -1170,6 +1200,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "handoff_artifact_status" => artifact_value(artifact_result, ["status"]),
         "external_verification" => Map.drop(external_verification, ["violations"]),
         "runner_status" => runner_result_status(runner_result),
+        "lane_contract_status" => nil,
+        "completion_states" => %{},
+        "blocker_reason" => nil,
+        "blocked_transition" => nil,
         "supervision" => Map.get(telemetry, "supervision"),
         "timeout_diagnostics" => Map.get(telemetry, "timeout_diagnostics"),
         "missing_evidence" => [],
@@ -1179,6 +1213,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     evidence
     |> merge_runner_findings(runner_result)
     |> merge_artifact_findings(artifact_result, external_verification)
+    |> apply_completion_contract(lane, issue, telemetry, deps)
     |> record_missing_evidence()
   end
 
@@ -1569,6 +1604,120 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     |> Map.put("finalization_gate_result", if(artifact_violations == [] and external_violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
   end
 
+  defp apply_completion_contract(evidence, lane, issue, telemetry, deps) do
+    completion_states = completion_states(lane, evidence, telemetry)
+    violations = completion_contract_violations(lane, evidence, completion_states)
+
+    if violations == [] do
+      evidence
+      |> Map.put("lane_contract_status", "passed")
+      |> Map.put("completion_states", completion_states)
+      |> Map.put("blocker_reason", nil)
+    else
+      blocker_reason = completion_blocker_reason(violations)
+      blocked_transition = maybe_block_completion_contract_issue(evidence, issue, blocker_reason, completion_states, deps)
+
+      evidence
+      |> Map.put("runner_status", failed_runner_status(evidence["runner_status"]))
+      |> Map.put("lane_contract_status", "failed")
+      |> Map.put("completion_states", Map.put(completion_states, "lane_contract_satisfied", false))
+      |> Map.put("blocker_reason", blocker_reason)
+      |> Map.put("blocked_transition", blocked_transition)
+      |> Map.put("final_state", Contract.current().blocked_state)
+      |> Map.put("expected_final_state", Contract.current().blocked_state)
+      |> Map.put("finalization_gate_result", "blocked")
+      |> Map.update!("protocol_violations", &(violations ++ &1))
+    end
+  end
+
+  defp completion_states(lane, evidence, telemetry) do
+    states = Map.get(telemetry, "completion_states") || %{}
+
+    %{
+      "codex_process_started" =>
+        truthy?(Map.get(states, "codex_process_started")) or
+          truthy?(Map.get(telemetry, "codex_process_started")) or not blank?(Map.get(telemetry, "codex_app_server_pid")),
+      "codex_prompt_delivered" =>
+        truthy?(Map.get(states, "codex_prompt_delivered")) or
+          truthy?(Map.get(telemetry, "codex_prompt_delivered")) or truthy?(Map.get(telemetry, "prompt_delivered")),
+      "codex_work_observed" =>
+        truthy?(Map.get(states, "codex_work_observed")) or
+          truthy?(Map.get(telemetry, "codex_work_observed")) or work_observed?(evidence, telemetry),
+      "symphony_handoff_ready_seen" =>
+        truthy?(Map.get(states, "symphony_handoff_ready_seen")) or
+          truthy?(Map.get(telemetry, "symphony_handoff_ready_seen")),
+      "lane_contract_satisfied" => preliminary_lane_contract_satisfied?(lane, evidence)
+    }
+  end
+
+  defp work_observed?(evidence, telemetry) do
+    integer_field(telemetry, "tool_call_count") > 0 or
+      non_empty_list?(Map.get(evidence, "product_changed_files")) or
+      non_empty_list?(Map.get(telemetry, "changed_files")) or
+      not blank?(Map.get(telemetry, "last_output_at"))
+  end
+
+  defp preliminary_lane_contract_satisfied?(lane, evidence) do
+    Map.get(evidence, "finalization_gate_result") == "ok" and
+      Map.get(evidence, "handoff_artifact_valid") == true and
+      (not repo_changing_lane?(lane) or non_empty_list?(Map.get(evidence, "product_changed_files")))
+  end
+
+  defp completion_contract_violations(lane, evidence, completion_states) do
+    []
+    |> maybe_add_completion_violation(
+      not truthy?(completion_states["codex_prompt_delivered"]),
+      "codex_prompt_not_delivered",
+      "Codex process/session completion is insufficient because prompt delivery was not observed."
+    )
+    |> maybe_add_completion_violation(
+      not truthy?(completion_states["codex_work_observed"]),
+      "codex_work_not_observed",
+      "Codex process/session completion is insufficient because no Codex work or product repository change was observed."
+    )
+    |> maybe_add_completion_violation(
+      not truthy?(completion_states["symphony_handoff_ready_seen"]),
+      "symphony_handoff_ready_not_seen",
+      "Lane completion signal SYMPHONY_HANDOFF_READY was not observed."
+    )
+    |> maybe_add_completion_violation(
+      repo_changing_lane?(lane) and Map.get(evidence, "handoff_artifact_valid") != true,
+      "lane_contract_handoff_artifact_failed",
+      "Repo-changing Phase 3.6 lanes require a valid .phase36/handoff.json artifact."
+    )
+    |> maybe_add_completion_violation(
+      repo_changing_lane?(lane) and not non_empty_list?(Map.get(evidence, "product_changed_files")),
+      "lane_contract_product_repo_change_missing",
+      "Repo-changing Phase 3.6 lanes require at least one product repository change."
+    )
+    |> maybe_add_completion_violation(
+      Map.get(evidence, "finalization_gate_result") != "ok",
+      "lane_contract_finalization_gate_blocked",
+      "Lane completion contract is not satisfied while the finalization gate is blocked."
+    )
+  end
+
+  defp maybe_add_completion_violation(violations, true, code, message), do: [artifact_violation(code, message) | violations]
+  defp maybe_add_completion_violation(violations, false, _code, _message), do: violations
+
+  defp completion_blocker_reason([%{"code" => code} | _]), do: code
+  defp completion_blocker_reason(_violations), do: "lane_completion_contract_failed"
+
+  defp maybe_block_completion_contract_issue(%{"blocked_transition" => %{"status" => "blocked"}} = _evidence, _issue, _reason, _states, _deps) do
+    %{"status" => "already_blocked", "handoff_posted" => true}
+  end
+
+  defp maybe_block_completion_contract_issue(%{"runner_status" => "timeout"} = evidence, _issue, _reason, _states, _deps) do
+    get_in(evidence, ["timeout_diagnostics", "blocked_transition"]) || %{"status" => "timeout_block_handled"}
+  end
+
+  defp maybe_block_completion_contract_issue(_evidence, issue, blocker_reason, completion_states, deps) do
+    block_completion_contract_issue(issue, blocker_reason, completion_states, deps)
+  end
+
+  defp failed_runner_status("timeout"), do: "timeout"
+  defp failed_runner_status(_status), do: "error"
+
   defp artifact_value(%{"artifact" => artifact}, path) when is_map(artifact), do: get_in(artifact, path)
   defp artifact_value(_artifact_result, _path), do: nil
 
@@ -1901,6 +2050,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     |> Map.merge(token_usage(messages))
     |> Map.merge(workspace_git_telemetry(messages))
     |> Map.merge(session_telemetry(messages))
+    |> Map.merge(completion_telemetry(messages))
   end
 
   defp count_tool_calls(messages) do
@@ -2011,6 +2161,56 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp completion_telemetry(messages) do
+    states = %{
+      "codex_process_started" => Enum.any?(messages, &(not blank?(map_get(&1, :codex_app_server_pid)))),
+      "codex_prompt_delivered" => Enum.any?(messages, &(map_get(&1, :event) in [:prompt_delivered, "prompt_delivered"])),
+      "codex_work_observed" => Enum.any?(messages, &work_message?/1),
+      "symphony_handoff_ready_seen" => Enum.any?(messages, &handoff_ready_message?/1),
+      "lane_contract_satisfied" => false
+    }
+
+    %{
+      "completion_states" => states,
+      "codex_process_started" => states["codex_process_started"],
+      "codex_prompt_delivered" => states["codex_prompt_delivered"],
+      "codex_work_observed" => states["codex_work_observed"],
+      "symphony_handoff_ready_seen" => states["symphony_handoff_ready_seen"]
+    }
+  end
+
+  defp work_message?(message) do
+    event = map_get(message, :event)
+
+    event in [
+      :stream_output,
+      "stream_output",
+      :tool_call_completed,
+      "tool_call_completed",
+      :tool_call_failed,
+      "tool_call_failed",
+      :notification,
+      "notification",
+      :turn_completed,
+      "turn_completed"
+    ]
+  end
+
+  defp handoff_ready_message?(message) when is_binary(message),
+    do: String.contains?(message, "SYMPHONY_HANDOFF_READY")
+
+  defp handoff_ready_message?(%_{}), do: false
+
+  defp handoff_ready_message?(message) when is_map(message) do
+    Enum.any?(message, fn {_key, value} -> handoff_ready_message?(value) end)
+  end
+
+  defp handoff_ready_message?(message) when is_list(message) do
+    Enum.any?(message, &handoff_ready_message?/1)
+  end
+
+  defp handoff_ready_message?(_message), do: false
 
   defp normalize_timestamp(%DateTime{} = timestamp), do: timestamp |> DateTime.truncate(:second) |> DateTime.to_iso8601()
   defp normalize_timestamp(timestamp) when is_binary(timestamp), do: timestamp

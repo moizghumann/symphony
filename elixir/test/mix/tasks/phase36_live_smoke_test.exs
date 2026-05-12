@@ -7,6 +7,9 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
   setup do
     Mix.Task.reenable("phase36.live_smoke")
+    Process.delete({__MODULE__, :phase36_issue_payload})
+    Process.delete({__MODULE__, :phase36_issue_state})
+    Process.delete({__MODULE__, :phase36_issue_comments})
     :ok
   end
 
@@ -283,6 +286,13 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     [lane_result] = evidence["results"]
     assert lane_result["handoff_artifact_valid"] == true
     assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["runner_status"] == "ok"
+    assert lane_result["lane_contract_status"] == "passed"
+    assert lane_result["completion_states"]["codex_process_started"] == true
+    assert lane_result["completion_states"]["codex_prompt_delivered"] == true
+    assert lane_result["completion_states"]["codex_work_observed"] == true
+    assert lane_result["completion_states"]["symphony_handoff_ready_seen"] == true
+    assert lane_result["completion_states"]["lane_contract_satisfied"] == true
     assert lane_result["repo_changed"] == true
     assert lane_result["product_changed_files"] == ["docs/validation/phase-3-6-orchestration-validation.md"]
     assert lane_result["control_artifacts"] == [".phase36/handoff.json"]
@@ -323,7 +333,134 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     [lane_result] = evidence["results"]
     assert lane_result["handoff_artifact_valid"] == false
     assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["blocked_transition"]["status"] == "blocked"
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+
+    File.rm(output_path)
+  end
+
+  test "fails and blocks when process starts but prompt work and handoff are not observed" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          workspace_path = temp_workspace_path()
+          File.mkdir_p!(workspace_path)
+
+          {:ok,
+           %{
+             "workspace_path" => workspace_path,
+             "codex_app_server_pid" => "12345",
+             "tool_call_count" => 0,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 0,
+             "budget_state" => "ok",
+             "changed_files" => []
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["completion_states"]["codex_process_started"] == true
+    assert lane_result["completion_states"]["codex_prompt_delivered"] == false
+    assert lane_result["completion_states"]["codex_work_observed"] == false
+    assert lane_result["completion_states"]["symphony_handoff_ready_seen"] == false
+    assert lane_result["completion_states"]["lane_contract_satisfied"] == false
+    assert lane_result["blocked_transition"]["status"] == "blocked"
+    assert current_issue_state()["name"] == "Blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "codex_prompt_not_delivered"))
+
+    File.rm(output_path)
+  end
+
+  test "fails and blocks when process exits zero without handoff artifact" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          workspace_path = temp_workspace_path()
+          File.mkdir_p!(workspace_path)
+
+          {:ok,
+           %{
+             "workspace_path" => workspace_path,
+             "codex_app_server_pid" => "12345",
+             "tool_call_count" => 1,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 1,
+             "budget_state" => "ok",
+             "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"],
+             "completion_states" => %{
+               "codex_process_started" => true,
+               "codex_prompt_delivered" => true,
+               "codex_work_observed" => true,
+               "symphony_handoff_ready_seen" => false
+             }
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["blocked_transition"]["status"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "symphony_handoff_ready_not_seen"))
+
+    File.rm(output_path)
+  end
+
+  test "fails and blocks when docs prompt is delivered without product repo change" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("docs"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact, %{"lane" => "docs", "changed_files" => []}},
+             %{"changed_files" => []}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["completion_states"]["codex_prompt_delivered"] == true
+    assert lane_result["completion_states"]["symphony_handoff_ready_seen"] == true
+    assert lane_result["product_changed_files"] == []
+    assert lane_result["blocked_transition"]["status"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_contract_product_repo_change_missing"))
 
     File.rm(output_path)
   end
@@ -798,7 +935,14 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
         "generic_linear_graphql_calls" => 0,
         "narrow_linear_lifecycle_calls" => 1,
         "budget_state" => "ok",
-        "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"]
+        "changed_files" => ["docs/validation/phase-3-6-orchestration-validation.md"],
+        "codex_app_server_pid" => "12345",
+        "completion_states" => %{
+          "codex_process_started" => true,
+          "codex_prompt_delivered" => true,
+          "codex_work_observed" => true,
+          "symphony_handoff_ready_seen" => true
+        }
       },
       telemetry_overrides
     )
