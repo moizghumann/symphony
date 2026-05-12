@@ -306,6 +306,134 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     File.rm(output_path)
   end
 
+  test "accepts a valid test handoff artifact with explicit test evidence" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("test"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          changed_files = ["elixir/test/symphony_elixir/phase36_orchestration_validation_test.exs"]
+
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "test",
+                "changed_files" => changed_files,
+                "targeted_tests_run" => true,
+                "test_coverage_added" => true,
+                "validation_command" => "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs",
+                "validation_status" => "passed",
+                "validation_reason" => "Focused Phase 3.6 regression passed."
+              }},
+             %{"changed_files" => changed_files}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["runner_status"] == "ok"
+    assert lane_result["lane_contract_status"] == "passed"
+    assert lane_result["targeted_tests_run"] == true
+    assert lane_result["test_coverage_added"] == true
+    assert lane_result["validation_status"] == "passed"
+    refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "tests_not_run"))
+    refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "test_coverage_missing"))
+
+    File.rm(output_path)
+  end
+
+  test "test handoff artifact missing targeted_tests_run blocks with tests_not_run" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("test"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          changed_files = ["elixir/test/symphony_elixir/phase36_orchestration_validation_test.exs"]
+
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "test",
+                "changed_files" => changed_files,
+                "targeted_tests_run" => nil,
+                "test_coverage_added" => true,
+                "validation_command" => "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs",
+                "validation_status" => "passed",
+                "validation_reason" => "Focused Phase 3.6 regression passed."
+              }},
+             %{"changed_files" => changed_files}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["runner_status"] == "error"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "tests_not_run"))
+
+    File.rm(output_path)
+  end
+
+  test "test handoff artifact missing test_coverage_added blocks with test_coverage_missing" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("test"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          changed_files = ["elixir/test/symphony_elixir/phase36_orchestration_validation_test.exs"]
+
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "lane" => "test",
+                "changed_files" => changed_files,
+                "targeted_tests_run" => true,
+                "test_coverage_added" => nil,
+                "validation_command" => "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs",
+                "validation_status" => "passed",
+                "validation_reason" => "Focused Phase 3.6 regression passed."
+              }},
+             %{"changed_files" => changed_files}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["runner_status"] == "error"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "test_coverage_missing"))
+
+    File.rm(output_path)
+  end
+
   test "fails a lane when the handoff artifact is missing" do
     output_path = temp_output_path()
 
@@ -1201,7 +1329,16 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     }
   end
 
-  defp default_lane_evidence("test"), do: %{"targeted_tests_run" => true, "test_coverage_added" => true}
+  defp default_lane_evidence("test") do
+    %{
+      "targeted_tests_run" => true,
+      "test_coverage_added" => true,
+      "validation_command" => default_validation_command("test"),
+      "validation_status" => "passed",
+      "validation_reason" => "Focused regression test coverage passed."
+    }
+  end
+
   defp default_lane_evidence(_lane), do: %{}
 
   defp issue_lane(issue) do

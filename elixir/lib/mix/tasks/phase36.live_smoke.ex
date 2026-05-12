@@ -1132,7 +1132,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     observed_changed_files = Map.get(telemetry, "changed_files") || []
     product_changed_files = effective_changed_files(changed_files, observed_changed_files)
     control_artifacts = control_artifacts(changed_files, observed_changed_files, artifact_result)
-    validation = artifact_value(artifact_result, ["validation"]) || Map.get(telemetry, "validation") || %{}
+    validation = artifact_validation(artifact_result, telemetry)
     artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
     repo_changed = repo_changed?(artifact_repo_changed, product_changed_files, pr_url)
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
@@ -1182,6 +1182,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "validation_command_result" => Map.get(validation, "command_result"),
         "validation_command" => Map.get(validation, "command"),
         "validation_reason" => Map.get(validation, "reason"),
+        "targeted_tests_run" => artifact_or_telemetry_value(artifact_result, telemetry, "targeted_tests_run"),
+        "test_coverage_added" => artifact_or_telemetry_value(artifact_result, telemetry, "test_coverage_added"),
         "repo_changed" => repo_changed,
         "effective_tokens" => Map.get(telemetry, "effective_tokens"),
         "gross_context_tokens" => Map.get(telemetry, "gross_context_tokens"),
@@ -1354,7 +1356,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   defp validate_handoff_artifact(artifact, lane, issue, _classification, telemetry) do
     observed_changed_files = FinalizationGate.product_changed_files(Map.get(telemetry, "changed_files") || [])
-    validation = Map.get(artifact, "validation") || %{}
+    nested_validation = Map.get(artifact, "validation") || %{}
+    validation = artifact_validation(%{"artifact" => artifact}, telemetry)
     handoff = Map.get(artifact, "handoff") || %{}
     repo_changed = truthy?(Map.get(artifact, "repo_changed"))
     protocol_notes = List.wrap(Map.get(artifact, "protocol_notes")) |> Enum.reject(&blank?/1)
@@ -1369,10 +1372,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       |> require_artifact_field(artifact, "commit_sha")
       |> require_artifact_field(artifact, "pr_url")
       |> require_artifact_field(artifact, "changed_files")
-      |> require_artifact_field(validation, "required", "validation.required")
-      |> require_artifact_field(validation, "status", "validation.status")
-      |> require_artifact_field(validation, "command", "validation.command")
-      |> require_artifact_field(validation, "reason", "validation.reason")
+      |> require_artifact_field(nested_validation, "required", "validation.required")
+      |> require_artifact_field(nested_validation, "status", "validation.status")
+      |> require_artifact_field(nested_validation, "command", "validation.command")
+      |> require_artifact_field(nested_validation, "reason", "validation.reason")
       |> require_artifact_field(handoff, "linear_comment_posted", "handoff.linear_comment_posted")
       |> require_artifact_field(handoff, "final_state_requested", "handoff.final_state_requested")
       |> require_artifact_field(artifact, "protocol_notes")
@@ -1381,6 +1384,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       |> docs_validation_violations(lane, validation)
       |> research_artifact_violations(lane, repo_changed, handoff, protocol_notes)
       |> lane_validation_violations(lane, validation)
+      |> test_artifact_violations(lane, artifact, validation)
 
     %{
       "artifact" => artifact,
@@ -1463,6 +1467,29 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "Feature, refactor, bug, test, and chore artifacts must include executed validation evidence."
     )
   end
+
+  defp test_artifact_violations(violations, "test", artifact, validation) do
+    violations
+    |> require_artifact_field(artifact, "targeted_tests_run")
+    |> require_artifact_field(artifact, "test_coverage_added")
+    |> maybe_add_violation(
+      validation_status(validation) in [nil, ""],
+      "missing_validation_status",
+      "Test lane artifacts must include validation_status or validation.status."
+    )
+    |> maybe_add_violation(
+      blank?(Map.get(validation, "command")),
+      "missing_validation_command",
+      "Test lane artifacts must include validation_command or validation.command."
+    )
+    |> maybe_add_violation(
+      blank?(Map.get(validation, "reason")),
+      "missing_validation_reason",
+      "Test lane artifacts must include validation_reason or validation.reason."
+    )
+  end
+
+  defp test_artifact_violations(violations, _lane, _artifact, _validation), do: violations
 
   defp external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, changed_files, expected_final_state, deps) do
     artifact = Map.get(artifact_result, "artifact") || %{}
@@ -1725,6 +1752,31 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
   defp artifact_value(%{"artifact" => artifact}, path) when is_map(artifact), do: get_in(artifact, path)
   defp artifact_value(_artifact_result, _path), do: nil
+
+  defp artifact_validation(%{"artifact" => artifact}, telemetry) when is_map(artifact) do
+    nested = Map.get(artifact, "validation") || %{}
+    telemetry_validation = Map.get(telemetry, "validation") || %{}
+
+    %{
+      "required" => first_present([Map.get(artifact, "validation_required"), Map.get(nested, "required"), Map.get(telemetry_validation, "required")]),
+      "status" => first_present([Map.get(artifact, "validation_status"), Map.get(nested, "status"), Map.get(telemetry_validation, "status")]),
+      "command" => first_present([Map.get(artifact, "validation_command"), Map.get(nested, "command"), Map.get(telemetry_validation, "command")]),
+      "reason" => first_present([Map.get(artifact, "validation_reason"), Map.get(nested, "reason"), Map.get(telemetry_validation, "reason")]),
+      "command_result" => first_present([Map.get(artifact, "validation_command_result"), Map.get(nested, "command_result"), Map.get(telemetry_validation, "command_result")])
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp artifact_validation(_artifact_result, telemetry), do: Map.get(telemetry, "validation") || %{}
+
+  defp first_present(values) do
+    Enum.find(values, fn
+      nil -> false
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> true
+    end)
+  end
 
   defp artifact_or_telemetry_value(artifact_result, telemetry, field) do
     case artifact_value(artifact_result, [field]) do
@@ -2138,6 +2190,12 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     - `handoff.linear_comment_posted`
     - `handoff.final_state_requested`
     - `protocol_notes`
+    For `test` lane artifacts, also include explicit top-level evidence fields:
+    - `targeted_tests_run`: `true` only when the targeted validation was run
+    - `test_coverage_added`: `true` only when test coverage was added or improved
+    - `validation_command`: exact command that was run
+    - `validation_status`: `passed`, `failed`, or `not_run`
+    - `validation_reason`: short evidence summary
     Do not emit `SYMPHONY_HANDOFF_READY` until the file exists and reflects the final handoff state.
     """
   end

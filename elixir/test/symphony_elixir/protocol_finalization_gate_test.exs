@@ -168,6 +168,32 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert result.finalization_gate_result == :ok
   end
 
+  test "test lane blocks when targeted test evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "test",
+        changed_files: ["test/product/runtime_test.exs"],
+        validation_status: :passed,
+        test_coverage_added: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :tests_not_run)
+  end
+
+  test "test lane blocks when coverage evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "test",
+        changed_files: ["test/product/runtime_test.exs"],
+        validation_status: :passed,
+        targeted_tests_run: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :test_coverage_missing)
+  end
+
   test "chore lane blocks config change when validation is missing" do
     run_state =
       base_run_state(%{
