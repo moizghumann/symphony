@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
 
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
-  alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate}
+  alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate, Validation}
 
   @contract %Contract{}
   @states [
@@ -175,6 +175,40 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert violation?(missing_result, :pr_required_but_missing)
       refute violation?(missing_result, :ticket_conflicts_with_workflow_policy)
       assert warning?(missing_result, :ticket_conflicts_with_workflow_policy)
+    end
+
+    test "live-smoke validation artifact carries test-lane evidence into finalization" do
+      workspace = validation_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+
+      validation_command = "cd elixir && mise exec -- mix test test/symphony_elixir/phase36_orchestration_validation_test.exs"
+
+      write_validation_artifact!(workspace, %{
+        "status" => "passed",
+        "reason" => "targeted Phase 3.6 regression passed",
+        "validation_command" => validation_command,
+        "targeted_tests_run" => true,
+        "test_coverage_added" => true
+      })
+
+      changed_files = ["test/symphony_elixir/phase36_orchestration_validation_test.exs"]
+      artifacts = Validation.summarize(workspace, changed_files, lane: "test")
+
+      assert artifacts.validation_status == :passed
+      assert artifacts.validation_reason == "targeted Phase 3.6 regression passed"
+      assert artifacts.validation_command == validation_command
+      assert artifacts.targeted_tests_run == true
+      assert artifacts.test_coverage_added == true
+
+      run_state =
+        run_state(%{
+          lane: "test",
+          changed_files: changed_files
+        })
+        |> Map.merge(artifacts)
+
+      assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+      assert result.finalization_gate_result == :ok
     end
   end
 
@@ -416,6 +450,24 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
         timestamp: DateTime.utc_now()
       }
     })
+  end
+
+  defp validation_workspace! do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-validation-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(Path.join(workspace, ".git"))
+    workspace
+  end
+
+  defp write_validation_artifact!(workspace, payload) do
+    File.write!(
+      Path.join([workspace, ".git", "symphony-validation.json"]),
+      Jason.encode!(payload)
+    )
   end
 
   defp docs_ticket do
