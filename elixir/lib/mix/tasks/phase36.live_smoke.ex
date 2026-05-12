@@ -45,6 +45,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     "explicitly_safe_validation_skip",
     "failure_signal_identified",
     "findings_posted",
+    "findings_ready_to_post",
     "recommendation_included",
     "scope_expanded",
     "sources_inspected_listed",
@@ -1115,7 +1116,10 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       Scope:
       - Read-only by default.
       - Do not create a branch, commit, or PR unless a repository artifact is explicitly required.
-      - Post findings through the narrow Linear handoff path, then move to Human Review.
+      - Inspect and list sources before concluding.
+      - Write `.phase36/handoff.json` with research findings, sources, recommendation, validation_status=not_run, and validation_reason=read-only research.
+      - Prefer Symphony-owned finalization: include findings_ready_to_post=true and do not move Linear to Human Review yourself.
+      - Emit SYMPHONY_HANDOFF_READY only after `.phase36/handoff.json` exists and contains the complete research handoff evidence.
 
       Validation:
       - Not required for read-only research.
@@ -1183,7 +1187,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "validation_command_result" => Map.get(validation, "command_result"),
         "validation_command" => Map.get(validation, "command"),
         "validation_reason" => Map.get(validation, "reason"),
+        "research_findings" => artifact_or_telemetry_value(artifact_result, telemetry, "research_findings"),
+        "sources_inspected" => artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected"),
+        "recommendation" => artifact_or_telemetry_value(artifact_result, telemetry, "recommendation"),
         "findings_posted" => findings_posted?(lane, artifact_result, comments),
+        "findings_ready_to_post" => artifact_or_telemetry_value(artifact_result, telemetry, "findings_ready_to_post"),
         "sources_inspected_listed" => artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected_listed"),
         "recommendation_included" => artifact_or_telemetry_value(artifact_result, telemetry, "recommendation_included"),
         "targeted_tests_run" => artifact_or_telemetry_value(artifact_result, telemetry, "targeted_tests_run"),
@@ -1467,19 +1475,26 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
 
     violations
     |> maybe_add_violation(
-      not truthy?(Map.get(handoff, "linear_comment_posted")) or protocol_notes == [],
+      not (truthy?(Map.get(handoff, "linear_comment_posted")) or truthy?(Map.get(artifact || %{}, "findings_ready_to_post"))) or protocol_notes == [],
       "research_findings_evidence_required",
-      "Read-only research artifacts must include findings evidence in protocol_notes and confirm the Linear comment was posted."
+      "Read-only research artifacts must include findings evidence in protocol_notes and either confirm the Linear comment was posted or mark findings_ready_to_post=true."
     )
-    |> maybe_add_violation(not truthy?(Map.get(artifact || %{}, "findings_posted")), "research_findings_missing", "Read-only research artifacts must record findings_posted=true.")
+    |> maybe_add_violation(not research_text_present?(artifact, "research_findings"), "research_findings_missing", "Read-only research artifacts must include research_findings text.")
+    |> maybe_add_violation(not research_sources_present?(artifact), "research_sources_missing", "Read-only research artifacts must include sources_inspected.")
+    |> maybe_add_violation(not research_text_present?(artifact, "recommendation"), "research_conclusion_missing", "Read-only research artifacts must include recommendation text.")
+    |> maybe_add_violation(
+      not (truthy?(Map.get(artifact || %{}, "findings_posted")) or truthy?(Map.get(artifact || %{}, "findings_ready_to_post"))),
+      "research_findings_post_status_missing",
+      "Read-only research artifacts must record findings_posted=true or findings_ready_to_post=true."
+    )
     |> maybe_add_violation(
       not truthy?(Map.get(artifact || %{}, "sources_inspected_listed")),
-      "research_sources_missing",
+      "research_sources_list_flag_missing",
       "Read-only research artifacts must record sources_inspected_listed=true."
     )
     |> maybe_add_violation(
       not truthy?(Map.get(artifact || %{}, "recommendation_included")),
-      "research_conclusion_missing",
+      "research_recommendation_flag_missing",
       "Read-only research artifacts must record recommendation_included=true."
     )
     |> maybe_add_violation(
@@ -1495,6 +1510,26 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   end
 
   defp research_artifact_violations(violations, _lane, _repo_changed, _handoff, _protocol_notes, _artifact), do: violations
+
+  defp research_text_present?(artifact, key) when is_map(artifact) do
+    case Map.get(artifact, key) do
+      value when is_binary(value) -> String.trim(value) != ""
+      values when is_list(values) -> Enum.any?(values, &(String.trim(to_string(&1)) != ""))
+      _value -> false
+    end
+  end
+
+  defp research_text_present?(_artifact, _key), do: false
+
+  defp research_sources_present?(artifact) when is_map(artifact) do
+    case Map.get(artifact, "sources_inspected") do
+      values when is_list(values) -> Enum.any?(values, &(String.trim(to_string(&1)) != ""))
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> false
+    end
+  end
+
+  defp research_sources_present?(_artifact), do: false
 
   defp lane_validation_violations(violations, lane, validation) do
     status = validation_status(validation)
@@ -1752,6 +1787,11 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       "Lane completion signal SYMPHONY_HANDOFF_READY was not observed."
     )
     |> maybe_add_completion_violation(
+      Map.get(evidence, "finalization_gate_result") != "ok",
+      "lane_contract_finalization_gate_blocked",
+      "Lane completion contract is not satisfied while the finalization gate is blocked."
+    )
+    |> maybe_add_completion_violation(
       (repo_changing_lane?(lane) or lane == "research") and Map.get(evidence, "handoff_artifact_valid") != true,
       "lane_contract_handoff_artifact_failed",
       "Phase 3.6 repo-changing and research lanes require a valid .phase36/handoff.json artifact."
@@ -1760,11 +1800,6 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
       repo_changing_lane?(lane) and not non_empty_list?(Map.get(evidence, "product_changed_files")),
       "lane_contract_product_repo_change_missing",
       "Repo-changing Phase 3.6 lanes require at least one product repository change."
-    )
-    |> maybe_add_completion_violation(
-      Map.get(evidence, "finalization_gate_result") != "ok",
-      "lane_contract_finalization_gate_blocked",
-      "Lane completion contract is not satisfied while the finalization gate is blocked."
     )
   end
 
@@ -2241,11 +2276,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     - `validation_status`: `passed`, `failed`, or `not_run`
     - `validation_reason`: short evidence summary
     For `research` lane artifacts, also include explicit top-level evidence fields:
-    - `findings_posted`: `true` only when findings were posted to Linear
+    - `research_findings`: concise findings text
+    - `sources_inspected`: non-empty list of files, URLs, issues, logs, or other sources inspected
+    - `recommendation`: concise recommendation or conclusion
+    - `findings_posted`: `true` only when findings were posted to Linear with a narrow helper
+    - `findings_ready_to_post`: `true` when findings were not posted and Symphony should post `research_findings`/`sources_inspected`/`recommendation`
     - `sources_inspected_listed`: `true` only when inspected sources are listed
     - `recommendation_included`: `true` only when a recommendation or conclusion is included
     - `validation_status`: `not_run`
     - `validation_reason`: `read-only research`
+    For read-only `research`, do not move Linear to Human Review yourself; Symphony posts the handoff and moves Human Review after the artifact passes. If you do post findings with a narrow Linear helper, this artifact is still required.
     Do not emit `SYMPHONY_HANDOFF_READY` until the file exists and reflects the final handoff state.
     """
   end

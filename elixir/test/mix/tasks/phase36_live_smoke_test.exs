@@ -686,6 +686,10 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
                 "commit_sha" => nil,
                 "pr_url" => nil,
                 "changed_files" => [],
+                "research_findings" => "The runner evidence gap is isolated to research handoff validation.",
+                "sources_inspected" => ["elixir/lib/mix/tasks/phase36.live_smoke.ex"],
+                "recommendation" => "Keep the research lane read-only and complete through Symphony-owned handoff.",
+                "findings_ready_to_post" => false,
                 "validation" => %{
                   "required" => false,
                   "status" => "not_run",
@@ -712,6 +716,9 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert lane_result["finalization_gate_result"] == "ok"
     assert lane_result["expected_final_state"] == "Human Review"
     assert lane_result["repo_changed"] == false
+    assert lane_result["research_findings"] =~ "research handoff validation"
+    assert lane_result["sources_inspected"] == ["elixir/lib/mix/tasks/phase36.live_smoke.ex"]
+    assert lane_result["recommendation"] =~ "Symphony-owned handoff"
     assert lane_result["findings_posted"] == true
     assert lane_result["sources_inspected_listed"] == true
     assert lane_result["recommendation_included"] == true
@@ -720,6 +727,81 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     refute Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_evidence_required"))
     assert_received {:moved_issue, "AWB-123", "In Progress"}
     refute_received {:moved_issue, "AWB-123", "Blocked"}
+
+    File.rm(output_path)
+  end
+
+  test "research artifact missing findings blocks" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, {:artifact, %{"research_findings" => ""}}, %{"changed_files" => []})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_findings_missing"))
+
+    File.rm(output_path)
+  end
+
+  test "research artifact missing sources blocks" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, {:artifact, %{"sources_inspected" => []}}, %{"changed_files" => []})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_sources_missing"))
+
+    File.rm(output_path)
+  end
+
+  test "research artifact missing recommendation blocks" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok, artifact_runner_result(issue, {:artifact, %{"recommendation" => ""}}, %{"changed_files" => []})}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "research_conclusion_missing"))
 
     File.rm(output_path)
   end
@@ -813,6 +895,52 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert get_in(lane_result, ["timeout_diagnostics", "git", "status"]) =~ "docs/validation"
     assert get_in(lane_result, ["timeout_diagnostics", "blocked_transition", "status"]) == "blocked"
     assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_runtime_timeout"))
+
+    File.rm(output_path)
+  end
+
+  test "research handoff-ready marker without artifact cannot pass" do
+    output_path = temp_output_path()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        run_agent: fn _issue, _preflight, _output_path ->
+          workspace_path = temp_workspace_path()
+          File.mkdir_p!(workspace_path)
+
+          {:ok,
+           %{
+             "workspace_path" => workspace_path,
+             "tool_call_count" => 0,
+             "generic_linear_graphql_calls" => 0,
+             "narrow_linear_lifecycle_calls" => 0,
+             "budget_state" => "ok",
+             "changed_files" => [],
+             "completion_states" => %{
+               "codex_process_started" => true,
+               "codex_prompt_delivered" => true,
+               "codex_work_observed" => true,
+               "symphony_handoff_ready_seen" => true
+             }
+           }}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == false
+    assert lane_result["runner_status"] == "error"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["blocker_reason"] == "lane_contract_handoff_artifact_failed"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "missing_handoff_artifact"))
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "lane_contract_handoff_artifact_failed"))
 
     File.rm(output_path)
   end
@@ -1031,6 +1159,19 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     assert workflow =~ "writableRoots:"
     assert workflow =~ ".git"
     assert workflow =~ "networkAccess: true"
+  end
+
+  test "generated live workflow makes research handoff artifact schema explicit" do
+    workflow = LiveSmoke.live_workflow_for_test("c7cc9de0cbf2", System.tmp_dir!())
+
+    assert workflow =~ "Before emitting `SYMPHONY_HANDOFF_READY`, write `.phase36/handoff.json`"
+    assert workflow =~ "`research_findings`: concise findings text"
+    assert workflow =~ "`sources_inspected`: non-empty list"
+    assert workflow =~ "`recommendation`: concise recommendation or conclusion"
+    assert workflow =~ "`findings_ready_to_post`: `true`"
+    assert workflow =~ "`validation_status`: `not_run`"
+    assert workflow =~ "`validation_reason`: `read-only research`"
+    assert workflow =~ "do not move Linear to Human Review yourself"
   end
 
   test "live-smoke Codex preflight records sandbox policy and writable git probe" do
@@ -1367,7 +1508,11 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
 
   defp default_lane_evidence("research") do
     %{
+      "research_findings" => "The runner evidence gap is isolated to research handoff validation.",
+      "sources_inspected" => ["elixir/lib/mix/tasks/phase36.live_smoke.ex"],
+      "recommendation" => "Keep the research lane read-only and complete through Symphony-owned handoff.",
       "findings_posted" => true,
+      "findings_ready_to_post" => false,
       "sources_inspected_listed" => true,
       "recommendation_included" => true,
       "validation_status" => "not_run",

@@ -143,38 +143,38 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
               ;;
             4)
               mkdir -p .phase36
-              cat > .phase36/handoff.json <<'JSON'
-        {
-          "lane": "research",
-          "linear_issue_identifier": "AGE-26",
-          "status": "handoff_ready",
-          "repo_changed": false,
-          "branch_name": null,
-          "commit_sha": null,
-          "pr_url": null,
-          "changed_files": [],
-          "findings_posted": true,
-          "sources_inspected_listed": true,
-          "recommendation_included": true,
-          "validation_status": "not_run",
-          "validation_reason": "read-only research",
-          "validation": {
-            "required": false,
-            "status": "not_run",
-            "command": "not required",
-            "reason": "read-only research"
-          },
-          "handoff": {
-            "linear_comment_posted": true,
-            "final_state_requested": "Human Review"
-          },
-          "protocol_notes": ["Findings posted to Linear handoff comment."]
-        }
-        JSON
+              printf '%s\\n' \
+                '{' \
+                '  "lane": "research",' \
+                '  "linear_issue_identifier": "AGE-26",' \
+                '  "status": "handoff_ready",' \
+                '  "repo_changed": false,' \
+                '  "branch_name": null,' \
+                '  "commit_sha": null,' \
+                '  "pr_url": null,' \
+                '  "changed_files": [],' \
+                '  "research_findings": "Docs are clear for the checked onboarding path.",' \
+                '  "sources_inspected": ["README.md"],' \
+                '  "recommendation": "No repository change is needed.",' \
+                '  "findings_posted": false,' \
+                '  "findings_ready_to_post": true,' \
+                '  "sources_inspected_listed": true,' \
+                '  "recommendation_included": true,' \
+                '  "validation_status": "not_run",' \
+                '  "validation_reason": "read-only research",' \
+                '  "validation": {' \
+                '    "required": false,' \
+                '    "status": "not_run",' \
+                '    "command": "not required",' \
+                '    "reason": "read-only research"' \
+                '  },' \
+                '  "handoff": {' \
+                '    "linear_comment_posted": false,' \
+                '    "final_state_requested": "Human Review"' \
+                '  },' \
+                '  "protocol_notes": ["Findings ready for Symphony-owned Linear handoff."]' \
+                '}' > .phase36/handoff.json
               printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research-ready"}}}'
-              printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research-ready","turnId":"turn-research-ready","arguments":{"issue_id":"issue-research-ready","body":"Findings: docs are clear. Sources: README.md. Recommendation: no repo change."}}}'
-              ;;
-            5)
               printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
               printf '%s\\n' '{"method":"turn/completed"}'
               exit 0
@@ -228,17 +228,105 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
         assert_receive {:linear_client_graphql, comment_query, %{issueId: "issue-research-ready", body: comment}}
         assert comment_query =~ "commentCreate"
         assert comment =~ "Findings:"
-        assert comment =~ "Sources:"
+        assert comment =~ "Sources inspected:"
         assert comment =~ "Recommendation:"
 
         assert_receive {:linear_client_graphql, update_query, %{issueId: "issue-research-ready", stateId: "state-human-review"}}
         assert update_query =~ "issueUpdate"
 
-        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :tool_call_completed, tool_name: "linear_post_handoff", tool_result: %{"success" => true}}}
+        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :linear_lifecycle_call, tool_name: "linear_post_handoff", tool_result: %{success: true}}}
         assert_receive {:codex_worker_update, "issue-research-ready", %{event: :linear_lifecycle_call, tool_name: "linear_move_to_human_review", tool_result: %{success: true}}}
 
         trace = File.read!(trace_file)
         refute trace =~ "No commits between"
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "research handoff-ready marker without artifact blocks before GitHub handoff" do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-research-missing-artifact-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        codex_binary = Path.join(test_root, "fake-codex")
+
+        File.mkdir_p!(workspace_root)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-research-missing-artifact"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research-missing-artifact"}}}'
+              printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          tracker_kind: "linear",
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          max_turns: 3
+        )
+
+        Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+        Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+        on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
+        issue = %Issue{
+          id: "issue-research-missing-artifact",
+          identifier: "AGE-27",
+          title: "Investigate read-only handoff artifact",
+          description: "Read-only research. No repository changes.",
+          state: "In Progress",
+          labels: ["research"],
+          lane_classification: %{
+            lane: :research,
+            reason: "explicit research lane",
+            matched_signals: ["label:research"],
+            policy_version: "2026-05-10.phase3"
+          },
+          available_states: [
+            %{id: "state-human-review", name: "Human Review"},
+            %{id: "state-blocked", name: "Blocked"}
+          ]
+        }
+
+        assert_raise RuntimeError, ~r/:handoff_artifact_missing/, fn ->
+          AgentRunner.run(issue, self(),
+            linear_lifecycle_graphql: &HandoffCommentIdLinearClient.graphql/2,
+            github_handoff: fn _workspace, _issue, _worker_host, _opts ->
+              flunk("GitHubHandoff must not run for read-only research without artifact")
+            end
+          )
+        end
+
+        refute_received {:linear_client_graphql, _query, %{issueId: "issue-research-missing-artifact", stateId: "state-human-review"}}
+        assert_receive {:linear_client_graphql, blocker_query, %{issueId: "issue-research-missing-artifact", body: blocker_comment}}
+        assert blocker_query =~ "commentCreate"
+        assert blocker_comment =~ "handoff_artifact_missing"
+        assert_receive {:linear_client_graphql, blocked_query, %{issueId: "issue-research-missing-artifact", stateId: "state-blocked"}}
+        assert blocked_query =~ "issueUpdate"
       after
         File.rm_rf(test_root)
       end
@@ -695,7 +783,11 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
           "commit_sha" => nil,
           "pr_url" => nil,
           "changed_files" => [],
+          "research_findings" => "Docs are clear for the checked onboarding path.",
+          "sources_inspected" => ["README.md"],
+          "recommendation" => "No repository change is needed.",
           "findings_posted" => true,
+          "findings_ready_to_post" => false,
           "sources_inspected_listed" => true,
           "recommendation_included" => true,
           "validation_status" => "not_run",

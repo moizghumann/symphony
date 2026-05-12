@@ -92,7 +92,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     "validation_status" => %{"type" => ["string", "null"]},
     "validation_reason" => %{"type" => ["string", "null"]},
     "lane" => %{"type" => ["string", "null"]},
+    "research_findings" => %{"type" => ["string", "null"]},
+    "sources_inspected" => %{"type" => ["array", "null"], "items" => %{"type" => "string"}},
+    "recommendation" => %{"type" => ["string", "null"]},
     "findings_posted" => %{"type" => ["boolean", "null"]},
+    "findings_ready_to_post" => %{"type" => ["boolean", "null"]},
     "sources_inspected_listed" => %{"type" => ["boolean", "null"]},
     "recommendation_included" => %{"type" => ["boolean", "null"]},
     "merged" => %{"type" => ["boolean", "null"]},
@@ -386,6 +390,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
     artifact_value(artifact, "lane") == "research" and
       truthy?(artifact_value(artifact, "findings_posted")) and
+      research_text_present?(artifact, "research_findings") and
+      research_sources_present?(artifact) and
+      research_text_present?(artifact, "recommendation") and
       truthy?(artifact_value(artifact, "sources_inspected_listed")) and
       truthy?(artifact_value(artifact, "recommendation_included")) and
       first_present([artifact_value(artifact, "validation_status"), artifact_value(validation, "status")]) == "not_run" and
@@ -425,6 +432,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp artifact_value(artifact, key, default \\ nil)
   defp artifact_value(%{} = artifact, key, default), do: Map.get(artifact, key, default)
   defp artifact_value(_artifact, _key, default), do: default
+
+  defp research_text_present?(artifact, key) do
+    case artifact_value(artifact, key) do
+      value when is_binary(value) -> String.trim(value) != ""
+      values when is_list(values) -> Enum.any?(values, &(String.trim(to_string(&1)) != ""))
+      _value -> false
+    end
+  end
+
+  defp research_sources_present?(artifact) do
+    case artifact_value(artifact, "sources_inspected") do
+      values when is_list(values) -> Enum.any?(values, &(String.trim(to_string(&1)) != ""))
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> false
+    end
+  end
 
   defp first_present(values) do
     Enum.find(values, fn

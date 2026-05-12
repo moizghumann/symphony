@@ -269,17 +269,33 @@ defmodule SymphonyElixir.AgentRunner do
     contract = Contract.current()
     run_state = research_run_state(issue, artifact)
 
-    case {FinalizationGate.evaluate(run_state, contract.review_state, contract), research_artifact_violations(artifact, run_state)} do
-      {{:ok, _gate_result}, []} ->
-        result = Tracker.move_issue_to_state(issue, contract.review_state)
-        record_linear_lifecycle(opts, "linear_move_to_human_review", %{issue_id: issue.id, target_state: contract.review_state}, result)
-        result
+    case research_artifact_violations(artifact, run_state) do
+      [] ->
+        with :ok <- ensure_research_handoff_posted(issue, artifact, run_state, opts) do
+          final_run_state =
+            run_state
+            |> Map.put(:handoff_posted, true)
+            |> Map.put(:findings_posted, true)
 
-      {{:ok, gate_result}, violations} ->
-        block_read_only_research_handoff(issue, {:research_handoff_artifact_invalid, violations, gate_result})
+          case FinalizationGate.evaluate(final_run_state, contract.review_state, contract) do
+            {:ok, _gate_result} ->
+              result = Tracker.move_issue_to_state(issue, contract.review_state)
+              record_linear_lifecycle(opts, "linear_move_to_human_review", %{issue_id: issue.id, target_state: contract.review_state}, result)
+              result
 
-      {{:blocked, gate_result}, _violations} ->
-        block_read_only_research_handoff(issue, {:finalization_gate_blocked, gate_result})
+            {:blocked, gate_result} ->
+              block_read_only_research_handoff(issue, {:finalization_gate_blocked, gate_result})
+          end
+        else
+          {:error, reason} ->
+            block_read_only_research_handoff(issue, reason)
+        end
+
+      violations ->
+        case FinalizationGate.evaluate(run_state, contract.review_state, contract) do
+          {:ok, gate_result} -> block_read_only_research_handoff(issue, {:research_handoff_artifact_invalid, violations, gate_result})
+          {:blocked, gate_result} -> block_read_only_research_handoff(issue, {:finalization_gate_blocked, gate_result, violations})
+        end
     end
   end
 
@@ -317,7 +333,7 @@ defmodule SymphonyElixir.AgentRunner do
       validation_required: false,
       validation_status: normalize_validation_status(Map.get(artifact, "validation_status") || Map.get(validation, "status")),
       validation_reason: Map.get(artifact, "validation_reason") || Map.get(validation, "reason"),
-      findings_posted: truthy?(Map.get(artifact, "findings_posted")),
+      findings_posted: research_handoff_comment_posted?() or truthy?(Map.get(artifact, "findings_posted")),
       sources_inspected_listed: truthy?(Map.get(artifact, "sources_inspected_listed")),
       recommendation_included: truthy?(Map.get(artifact, "recommendation_included")),
       budget_state: :ok
@@ -329,10 +345,73 @@ defmodule SymphonyElixir.AgentRunner do
       {normalize_lane(Map.get(artifact, "lane") || Map.get(artifact, :lane)) == "research", :research_lane_missing},
       {Map.get(run_state, :validation_status) == :not_run, :research_validation_status_invalid},
       {Map.get(run_state, :validation_reason) == "read-only research", :research_validation_reason_invalid},
-      {Map.get(run_state, :handoff_posted) == true, :research_handoff_comment_missing}
+      {research_findings_present?(artifact), :research_findings_missing},
+      {sources_inspected_present?(artifact), :research_sources_missing},
+      {research_recommendation_present?(artifact), :research_conclusion_missing},
+      {truthy?(Map.get(artifact, "sources_inspected_listed")), :research_sources_list_flag_missing},
+      {truthy?(Map.get(artifact, "recommendation_included")), :research_recommendation_flag_missing},
+      {truthy?(Map.get(artifact, "findings_posted")) or truthy?(Map.get(artifact, "findings_ready_to_post")), :research_findings_post_status_missing},
+      {Map.get(run_state, :handoff_posted) == true or truthy?(Map.get(artifact, "findings_ready_to_post")), :research_handoff_comment_missing}
     ]
     |> Enum.reject(fn {valid?, _code} -> valid? end)
     |> Enum.map(fn {_valid?, code} -> code end)
+  end
+
+  defp ensure_research_handoff_posted(_issue, _artifact, %{handoff_posted: true}, _opts), do: :ok
+
+  defp ensure_research_handoff_posted(%Issue{} = issue, artifact, _run_state, opts) do
+    if truthy?(Map.get(artifact, "findings_ready_to_post")) do
+      body = research_handoff_body(artifact)
+      result = Tracker.post_handoff_comment_result(issue, body)
+      record_linear_lifecycle(opts, "linear_post_handoff", %{issue_id: issue.id, body: body}, result)
+
+      case result do
+        {:ok, _payload} -> :ok
+        {:error, reason} -> {:error, {:research_handoff_comment_failed, reason}}
+      end
+    else
+      {:error, :research_handoff_comment_missing}
+    end
+  end
+
+  defp research_handoff_body(artifact) do
+    sources =
+      artifact
+      |> sources_inspected()
+      |> Enum.map_join("\n", &"- #{&1}")
+
+    """
+    ## Symphony Research Handoff
+
+    Findings:
+    #{artifact_text(artifact, "research_findings")}
+
+    Sources inspected:
+    #{sources}
+
+    Recommendation:
+    #{artifact_text(artifact, "recommendation")}
+    """
+  end
+
+  defp research_findings_present?(artifact), do: artifact_text(artifact, "research_findings") != ""
+  defp sources_inspected_present?(artifact), do: sources_inspected(artifact) != []
+  defp research_recommendation_present?(artifact), do: artifact_text(artifact, "recommendation") != ""
+
+  defp artifact_text(artifact, key) do
+    case Map.get(artifact, key) do
+      value when is_binary(value) -> String.trim(value)
+      values when is_list(values) -> values |> Enum.map(&to_string/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.join("\n")
+      _value -> ""
+    end
+  end
+
+  defp sources_inspected(artifact) do
+    case Map.get(artifact, "sources_inspected") do
+      values when is_list(values) -> values |> Enum.map(&to_string/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+      value when is_binary(value) -> value |> String.split("\n") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+      _value -> []
+    end
   end
 
   defp read_phase36_handoff_artifact(workspace, nil) do
@@ -374,6 +453,18 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
+  defp record_linear_lifecycle(opts, tool_name, args, {:ok, payload}) do
+    opts
+    |> Keyword.get(:lifecycle_recorder, fn _event -> :ok end)
+    |> apply_lifecycle_recorder(%{
+      tool_name: tool_name,
+      tool_arguments: args,
+      tool_result: Map.merge(%{success: true}, stringify_atom_keys(payload))
+    })
+
+    :ok
+  end
+
   defp record_linear_lifecycle(opts, tool_name, args, {:error, reason} = error) do
     opts
     |> Keyword.get(:lifecycle_recorder, fn _event -> :ok end)
@@ -385,6 +476,15 @@ defmodule SymphonyElixir.AgentRunner do
 
     error
   end
+
+  defp stringify_atom_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      pair -> pair
+    end)
+  end
+
+  defp stringify_atom_keys(_value), do: %{}
 
   defp apply_lifecycle_recorder(recorder, event) when is_function(recorder, 1) do
     recorder.(event)
