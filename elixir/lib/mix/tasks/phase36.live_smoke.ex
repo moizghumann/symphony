@@ -1130,8 +1130,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp evidence_for_lane(lane, issue, classification, runner_result, snapshot, deps) do
     telemetry = telemetry_from_runner_result(runner_result)
     artifact_result = handoff_artifact_result(lane, issue, classification, telemetry)
-    comments = get_in(snapshot, ["comments", "nodes"]) || []
-    pr_url = artifact_value(artifact_result, ["pr_url"]) || find_pr_url(comments) || Map.get(telemetry, "pr_url")
+    initial_comments = get_in(snapshot, ["comments", "nodes"]) || []
+    pr_url = artifact_value(artifact_result, ["pr_url"]) || find_pr_url(initial_comments) || Map.get(telemetry, "pr_url")
     changed_files = artifact_value(artifact_result, ["changed_files"])
     observed_changed_files = Map.get(telemetry, "changed_files") || []
     product_changed_files = effective_changed_files(changed_files, observed_changed_files)
@@ -1139,7 +1139,16 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     validation = artifact_validation(artifact_result, telemetry)
     artifact_repo_changed = artifact_value(artifact_result, ["repo_changed"])
     repo_changed = repo_changed?(artifact_repo_changed, product_changed_files, pr_url)
+
+    research_handoff =
+      finalize_read_only_research_handoff(lane, issue, artifact_result, snapshot, repo_changed, deps)
+
+    snapshot = Map.get(research_handoff, "snapshot", snapshot)
+    comments = get_in(snapshot, ["comments", "nodes"]) || []
+    pr_url = artifact_value(artifact_result, ["pr_url"]) || find_pr_url(comments) || Map.get(telemetry, "pr_url")
     final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || issue.state
+    findings_posted = findings_posted?(lane, artifact_result, comments) or truthy?(Map.get(research_handoff, "findings_posted"))
+    handoff_posted = truthy?(artifact_value(artifact_result, ["handoff", "linear_comment_posted"])) or handoff_comment(comments) != nil or findings_posted
 
     gate_result =
       %{
@@ -1153,21 +1162,28 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         commit_sha: artifact_value(artifact_result, ["commit_sha"]) || Map.get(telemetry, "commit_sha"),
         branch_pushed: not blank?(pr_url),
         pr_posted_to_linear: not blank?(pr_url),
-        handoff_posted: truthy?(artifact_value(artifact_result, ["handoff", "linear_comment_posted"])) or handoff_comment(comments) != nil,
+        handoff_posted: handoff_posted,
         validation_required: Map.get(validation, "required"),
         validation_status: validation_status(validation),
         validation_reason: Map.get(validation, "reason"),
-        findings_posted: findings_posted?(lane, artifact_result, comments),
+        findings_posted: findings_posted,
         sources_inspected_listed: artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected_listed"),
         recommendation_included: artifact_or_telemetry_value(artifact_result, telemetry, "recommendation_included"),
         budget_state: Map.get(telemetry, "budget_state", :ok),
         generic_linear_graphql_calls: Map.get(telemetry, "generic_linear_graphql_call_details", [])
       }
       |> Map.merge(artifact_gate_evidence(artifact_result, telemetry))
+      |> Map.put(:findings_posted, findings_posted)
+      |> Map.put(:handoff_posted, handoff_posted)
       |> finalization_gate_result()
 
+    review_transition = maybe_move_research_to_human_review(lane, issue, snapshot, repo_changed, research_handoff, gate_result, deps)
+    snapshot = Map.get(review_transition, "snapshot", snapshot)
+    comments = get_in(snapshot, ["comments", "nodes"]) || comments
+    final_state = artifact_value(artifact_result, ["handoff", "final_state_requested"]) || get_in(snapshot, ["state", "name"]) || final_state
     expected_final_state = expected_final_state(lane, runner_result, final_state, gate_result)
     external_verification = external_verification_result(lane, issue, artifact_result, telemetry, snapshot, repo_changed, product_changed_files, expected_final_state, deps)
+    handoff_comment_id_or_url = handoff_comment_id_or_url(comments) || Map.get(research_handoff, "handoff_comment_id_or_url")
 
     evidence =
       %{
@@ -1190,7 +1206,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "research_findings" => artifact_or_telemetry_value(artifact_result, telemetry, "research_findings"),
         "sources_inspected" => artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected"),
         "recommendation" => artifact_or_telemetry_value(artifact_result, telemetry, "recommendation"),
-        "findings_posted" => findings_posted?(lane, artifact_result, comments),
+        "findings_posted" => findings_posted,
         "findings_ready_to_post" => artifact_or_telemetry_value(artifact_result, telemetry, "findings_ready_to_post"),
         "sources_inspected_listed" => artifact_or_telemetry_value(artifact_result, telemetry, "sources_inspected_listed"),
         "recommendation_included" => artifact_or_telemetry_value(artifact_result, telemetry, "recommendation_included"),
@@ -1208,7 +1224,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "finalization_gate_result" => gate_result["result"],
         "protocol_violations" => gate_result["violations"],
         "protocol_warnings" => gate_result["warnings"],
-        "handoff_comment_id_or_url" => handoff_comment_id_or_url(comments),
+        "handoff_comment_id_or_url" => handoff_comment_id_or_url,
         "handoff_artifact_path" => Map.get(artifact_result, "path"),
         "handoff_artifact_valid" => Map.get(artifact_result, "valid", false),
         "handoff_artifact_status" => artifact_value(artifact_result, ["status"]),
@@ -1223,6 +1239,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
         "completion_states" => %{},
         "blocker_reason" => nil,
         "blocked_transition" => nil,
+        "research_handoff_finalization" => Map.drop(research_handoff, ["snapshot"]),
+        "research_review_transition" => Map.drop(review_transition, ["snapshot"]),
         "supervision" => Map.get(telemetry, "supervision"),
         "timeout_diagnostics" => Map.get(telemetry, "timeout_diagnostics"),
         "missing_evidence" => [],
@@ -1232,6 +1250,7 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     evidence
     |> merge_runner_findings(runner_result)
     |> merge_artifact_findings(artifact_result, external_verification)
+    |> merge_research_finalization_findings(research_handoff)
     |> apply_completion_contract(lane, issue, telemetry, deps)
     |> record_missing_evidence()
   end
@@ -1686,6 +1705,159 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     )
   end
 
+  defp finalize_read_only_research_handoff("research", issue, artifact_result, snapshot, false, deps) do
+    artifact = Map.get(artifact_result, "artifact") || %{}
+    comments = get_in(snapshot, ["comments", "nodes"]) || []
+
+    cond do
+      Map.get(artifact_result, "valid") != true ->
+        %{"status" => "skipped", "reason" => "handoff_artifact_invalid", "snapshot" => snapshot}
+
+      handoff_comment(comments) != nil or truthy?(get_in(artifact, ["handoff", "linear_comment_posted"])) ->
+        %{
+          "status" => "already_posted",
+          "findings_posted" => true,
+          "handoff_comment_id_or_url" => handoff_comment_id_or_url(comments),
+          "snapshot" => snapshot
+        }
+
+      not research_artifact_ready_to_post?(artifact) ->
+        %{"status" => "skipped", "reason" => "research_findings_not_ready_to_post", "snapshot" => snapshot}
+
+      true ->
+        post_artifact_research_handoff(issue, artifact, deps)
+    end
+  end
+
+  defp finalize_read_only_research_handoff(_lane, _issue, _artifact_result, snapshot, _repo_changed, _deps) do
+    %{"status" => "skipped", "snapshot" => snapshot}
+  end
+
+  defp post_artifact_research_handoff(issue, artifact, deps) do
+    body = research_handoff_body(artifact)
+
+    case deps.post_handoff_comment.(issue, body) do
+      :ok ->
+        snapshot = fetch_issue_snapshot(issue.id, deps)
+        comments = get_in(snapshot, ["comments", "nodes"]) || []
+
+        %{
+          "status" => "posted",
+          "findings_posted" => true,
+          "handoff_comment_id_or_url" => handoff_comment_id_or_url(comments),
+          "snapshot" => snapshot
+        }
+
+      {:error, reason} ->
+        blocked_transition = block_research_handoff_post_failure(issue, reason, deps)
+        snapshot = fetch_issue_snapshot(issue.id, deps)
+
+        %{
+          "status" => "post_failed",
+          "findings_posted" => false,
+          "reason" => inspect(reason),
+          "blocked_transition" => blocked_transition,
+          "snapshot" => snapshot
+        }
+
+      other ->
+        blocked_transition = block_research_handoff_post_failure(issue, other, deps)
+        snapshot = fetch_issue_snapshot(issue.id, deps)
+
+        %{
+          "status" => "post_failed",
+          "findings_posted" => false,
+          "reason" => inspect(other),
+          "blocked_transition" => blocked_transition,
+          "snapshot" => snapshot
+        }
+    end
+  end
+
+  defp maybe_move_research_to_human_review("research", issue, snapshot, false, %{"status" => status}, %{"result" => "ok"}, deps)
+       when status in ["posted", "already_posted"] do
+    if get_in(snapshot, ["state", "name"]) == Contract.current().review_state do
+      %{"status" => "already_in_human_review", "snapshot" => snapshot}
+    else
+      case deps.move_issue_to_state.(issue, Contract.current().review_state) do
+        :ok ->
+          %{"status" => "moved", "snapshot" => fetch_issue_snapshot(issue.id, deps)}
+
+        {:error, reason} ->
+          %{"status" => "move_failed", "reason" => inspect(reason), "snapshot" => snapshot}
+
+        other ->
+          %{"status" => "move_failed", "reason" => inspect(other), "snapshot" => snapshot}
+      end
+    end
+  end
+
+  defp maybe_move_research_to_human_review(_lane, _issue, snapshot, _repo_changed, _handoff, _gate_result, _deps) do
+    %{"status" => "skipped", "snapshot" => snapshot}
+  end
+
+  defp block_research_handoff_post_failure(issue, reason, deps) do
+    body = """
+    ## Symphony Handoff Blocked
+
+    Phase 3.6 live smoke could not post the read-only research handoff from the artifact.
+
+    Issue: #{issue.identifier || issue.id}
+    Reason: research_handoff_post_failed
+    Detail: #{inspect(reason)}
+    """
+
+    case deps.post_handoff_comment.(issue, body) do
+      :ok ->
+        case deps.move_issue_to_state.(issue, Contract.current().blocked_state) do
+          :ok -> %{"status" => "blocked", "handoff_posted" => true}
+          {:error, move_reason} -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(move_reason)}
+          other -> %{"status" => "block_failed", "handoff_posted" => true, "reason" => inspect(other)}
+        end
+
+      {:error, blocker_reason} ->
+        %{"status" => "handoff_failed", "handoff_posted" => false, "reason" => inspect(blocker_reason)}
+
+      other ->
+        %{"status" => "handoff_failed", "handoff_posted" => false, "reason" => inspect(other)}
+    end
+  end
+
+  defp research_artifact_ready_to_post?(artifact) do
+    (truthy?(Map.get(artifact, "findings_ready_to_post")) or research_text_present?(artifact, "research_findings")) and
+      research_text_present?(artifact, "research_findings") and
+      research_sources_present?(artifact) and
+      research_text_present?(artifact, "recommendation")
+  end
+
+  defp research_handoff_body(artifact) do
+    sources =
+      artifact
+      |> research_sources()
+      |> Enum.map_join("\n", &"- #{&1}")
+
+    """
+    ## Symphony Research Handoff
+
+    Findings:
+    #{String.trim(to_string(Map.get(artifact, "research_findings") || ""))}
+
+    Sources inspected:
+    #{sources}
+
+    Recommendation:
+    #{String.trim(to_string(Map.get(artifact, "recommendation") || ""))}
+    """
+  end
+
+  defp research_sources(artifact) do
+    case Map.get(artifact, "sources_inspected") do
+      values when is_list(values) -> values |> Enum.map(&to_string/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+      value when is_binary(value) -> value |> String.split("\n") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+      _value -> []
+    end
+  end
+
   defp merge_runner_findings(evidence, runner_result) do
     violations =
       case runner_result_status(runner_result) do
@@ -1709,6 +1881,19 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
     |> Map.update!("protocol_warnings", &(artifact_warnings ++ &1))
     |> Map.put("finalization_gate_result", if(artifact_violations == [] and external_violations == [], do: evidence["finalization_gate_result"], else: "blocked"))
   end
+
+  defp merge_research_finalization_findings(evidence, %{"status" => "post_failed"} = research_handoff) do
+    violation = artifact_violation("linear_research_handoff_post_failed", "Read-only research handoff comment could not be posted from the artifact.")
+
+    evidence
+    |> Map.update!("protocol_violations", &([violation | &1]))
+    |> Map.put("finalization_gate_result", "blocked")
+    |> Map.put("blocked_transition", Map.get(research_handoff, "blocked_transition"))
+    |> Map.put("expected_final_state", Contract.current().blocked_state)
+    |> Map.put("final_state", Contract.current().blocked_state)
+  end
+
+  defp merge_research_finalization_findings(evidence, _research_handoff), do: evidence
 
   defp apply_completion_contract(evidence, lane, issue, telemetry, deps) do
     completion_states = completion_states(lane, evidence, telemetry)
@@ -1809,8 +1994,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp completion_blocker_reason([%{"code" => code} | _]), do: code
   defp completion_blocker_reason(_violations), do: "lane_completion_contract_failed"
 
-  defp maybe_block_completion_contract_issue(%{"blocked_transition" => %{"status" => "blocked"}} = _evidence, _issue, _reason, _states, _deps) do
-    %{"status" => "already_blocked", "handoff_posted" => true}
+  defp maybe_block_completion_contract_issue(%{"blocked_transition" => %{"status" => "blocked"}} = evidence, _issue, _reason, _states, _deps) do
+    evidence["blocked_transition"]
   end
 
   defp maybe_block_completion_contract_issue(%{"runner_status" => "timeout"} = evidence, _issue, _reason, _states, _deps) do
@@ -2777,7 +2962,8 @@ defmodule Mix.Tasks.Phase36.LiveSmoke do
   defp handoff_comment(comments) do
     Enum.find(comments, fn comment ->
       body = comment["body"] || ""
-      String.contains?(body, "Symphony Handoff") or String.contains?(body, "Draft PR:")
+      not String.contains?(body, "Symphony Handoff Blocked") and
+        (String.contains?(body, "Symphony Handoff") or String.contains?(body, "Symphony Research Handoff") or String.contains?(body, "Draft PR:"))
     end)
   end
 

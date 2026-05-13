@@ -731,6 +731,150 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     File.rm(output_path)
   end
 
+  test "research artifact ready to post is posted before Human Review gate" do
+    output_path = temp_output_path()
+    parent = self()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        github_verify: fn _artifact, _context -> flunk("GitHubHandoff/GitHub verification must not run for read-only research") end,
+        linear_graphql: &fake_linear_graphql/2,
+        move_issue_to_state: fn issue, state ->
+          send(parent, {:moved_issue, issue.identifier, state})
+          Process.put({__MODULE__, :phase36_issue_state}, state_payload(state))
+          :ok
+        end,
+        post_handoff_comment: fn issue, body ->
+          send(parent, {:posted_handoff, issue.identifier, body})
+          Process.put({__MODULE__, :phase36_issue_comments}, [%{"id" => "comment-research", "url" => "https://linear.app/comment/research", "body" => body}])
+          :ok
+        end,
+        linear_verify: fn _issue, _artifact, snapshot, context ->
+          assert Map.fetch!(context, :expected_final_state) == "Human Review"
+          comments = get_in(snapshot, ["comments", "nodes"]) || []
+          assert Enum.any?(comments, &(String.contains?(&1["body"] || "", "Symphony Research Handoff")))
+
+          {:ok,
+           %{
+             "final_state" => "Human Review",
+             "handoff_comment_exists" => true,
+             "blocker_comment_exists" => false,
+             "pr_url_posted" => false,
+             "research_findings_posted" => true
+           }}
+        end,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "findings_posted" => false,
+                "findings_ready_to_post" => true,
+                "handoff" => %{"linear_comment_posted" => false}
+              }},
+             %{"changed_files" => []}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == true
+    assert lane_result["findings_posted"] == true
+    assert lane_result["handoff_comment_id_or_url"] == "https://linear.app/comment/research"
+    assert lane_result["finalization_gate_result"] == "ok"
+    assert lane_result["expected_final_state"] == "Human Review"
+    assert lane_result["runner_status"] == "ok"
+    assert lane_result["lane_contract_status"] == "passed"
+    assert get_in(lane_result, ["external_verification", "linear", "research_findings_posted"]) == true
+    assert_received {:posted_handoff, "AWB-123", body}
+    assert body =~ "The runner evidence gap is isolated to research handoff validation."
+    assert body =~ "elixir/lib/mix/tasks/phase36.live_smoke.ex"
+    assert body =~ "Keep the research lane read-only"
+    assert_received {:moved_issue, "AWB-123", "Human Review"}
+    refute_received {:moved_issue, "AWB-123", "Blocked"}
+
+    File.rm(output_path)
+  end
+
+  test "failed research artifact handoff post blocks" do
+    output_path = temp_output_path()
+    parent = self()
+
+    deps =
+      inert_deps(%{
+        getenv: selector_env("research"),
+        github_preflight: fn -> :ok end,
+        linear_graphql: &fake_linear_graphql/2,
+        move_issue_to_state: fn issue, state ->
+          send(parent, {:moved_issue, issue.identifier, state})
+          Process.put({__MODULE__, :phase36_issue_state}, state_payload(state))
+          :ok
+        end,
+        post_handoff_comment: fn issue, body ->
+          if String.contains?(body, "Symphony Research Handoff") do
+            send(parent, {:failed_research_handoff, issue.identifier, body})
+            {:error, :linear_post_failed}
+          else
+            send(parent, {:posted_blocker, issue.identifier, body})
+            Process.put({__MODULE__, :phase36_issue_comments}, [%{"id" => "comment-blocker", "url" => "https://linear.app/comment/blocker", "body" => body}])
+            :ok
+          end
+        end,
+        linear_verify: fn _issue, _artifact, _snapshot, context ->
+          assert Map.fetch!(context, :expected_final_state) == "Blocked"
+
+          {:ok,
+           %{
+             "final_state" => "Blocked",
+             "handoff_comment_exists" => false,
+             "blocker_comment_exists" => true,
+             "pr_url_posted" => false,
+             "research_findings_posted" => false
+           }}
+        end,
+        run_agent: fn issue, _preflight, _output_path ->
+          {:ok,
+           artifact_runner_result(
+             issue,
+             {:artifact,
+              %{
+                "findings_posted" => false,
+                "findings_ready_to_post" => true,
+                "handoff" => %{"linear_comment_posted" => false}
+              }},
+             %{"changed_files" => []}
+           )}
+        end,
+        write_file: &File.write!/2
+      })
+
+    assert :ok = LiveSmoke.run_with_deps(["--output", output_path], deps)
+
+    evidence = output_path |> File.read!() |> Jason.decode!()
+    [lane_result] = evidence["results"]
+    assert lane_result["handoff_artifact_valid"] == true
+    assert lane_result["findings_posted"] == false
+    assert lane_result["expected_final_state"] == "Blocked"
+    assert lane_result["finalization_gate_result"] == "blocked"
+    assert lane_result["lane_contract_status"] == "failed"
+    assert lane_result["blocked_transition"]["status"] == "blocked"
+    assert Enum.any?(lane_result["protocol_violations"], &(&1["code"] == "linear_research_handoff_post_failed"))
+    assert_received {:failed_research_handoff, "AWB-123", _body}
+    assert_received {:posted_blocker, "AWB-123", blocker_body}
+    assert blocker_body =~ "research_handoff_post_failed"
+    assert_received {:moved_issue, "AWB-123", "Blocked"}
+    refute_received {:moved_issue, "AWB-123", "Human Review"}
+
+    File.rm(output_path)
+  end
+
   test "research artifact missing findings blocks" do
     output_path = temp_output_path()
 
@@ -1723,7 +1867,7 @@ defmodule Mix.Tasks.Phase36.LiveSmokeTest do
     current_issue_payload()
     |> Map.put("state", state)
     |> Map.put("id", issue_id)
-    |> Map.put("comments", %{"nodes" => []})
+    |> Map.put("comments", %{"nodes" => Process.get({__MODULE__, :phase36_issue_comments}, [])})
   end
 
   defp remember_issue(issue) do
