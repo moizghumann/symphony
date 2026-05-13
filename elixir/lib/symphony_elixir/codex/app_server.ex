@@ -87,6 +87,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
         DynamicTool.execute(tool, arguments,
           issue: issue,
+          workspace: workspace,
           linear_lifecycle_graphql: Keyword.get(opts, :linear_lifecycle_graphql)
         )
       end)
@@ -102,7 +103,26 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            active_workspace_path: workspace,
+            active_workspace_git_root: Path.join(workspace, ".git"),
+            sandbox_policy_type: sandbox_policy_type(turn_sandbox_policy),
+            sandbox_writable_roots: sandbox_writable_roots(turn_sandbox_policy)
+          },
+          metadata
+        )
+
+        emit_message(
+          on_message,
+          :prompt_delivered,
+          %{
+            session_id: session_id,
+            thread_id: thread_id,
+            turn_id: turn_id,
+            active_workspace_path: workspace,
+            active_workspace_git_root: Path.join(workspace, ".git"),
+            sandbox_policy_type: sandbox_policy_type(turn_sandbox_policy),
+            sandbox_writable_roots: sandbox_writable_roots(turn_sandbox_policy)
           },
           metadata
         )
@@ -424,6 +444,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
+
+        if String.trim(payload_string) != "" do
+          emit_message(
+            on_message,
+            :stream_output,
+            %{
+              payload: payload_string,
+              raw: payload_string
+            },
+            metadata_from_message(port, %{raw: payload_string})
+          )
+        end
 
         if protocol_message_candidate?(payload_string) do
           emit_message(
@@ -1046,6 +1078,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp default_on_message(_message), do: :ok
+
+  defp sandbox_policy_type(policy) when is_map(policy), do: Map.get(policy, "type") || Map.get(policy, :type)
+  defp sandbox_policy_type(_policy), do: nil
+
+  defp sandbox_writable_roots(policy) when is_map(policy) do
+    case Map.get(policy, "writableRoots") || Map.get(policy, :writableRoots) do
+      roots when is_list(roots) -> Enum.map(roots, &to_string/1)
+      _ -> []
+    end
+  end
+
+  defp sandbox_writable_roots(_policy), do: []
 
   defp tool_call_name(params) when is_map(params) do
     case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do

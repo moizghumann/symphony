@@ -1,0 +1,229 @@
+{
+  "command": "mix phase36.live_smoke",
+  "generated_at": "2026-05-12T07:14:08Z",
+  "phase": "3.6",
+  "preflight": {
+    "github": "passed",
+    "github_checks": {
+      "auth_read": "passed",
+      "default_branch": "main",
+      "push_permission_check": "passed",
+      "repo": "moizghumann/symphony",
+      "status": "passed",
+      "viewer_permission": "ADMIN"
+    },
+    "linear": "passed",
+    "mix_pubsub_local_socket": {
+      "socket": "passed",
+      "status": "passed"
+    },
+    "project": {
+      "id": "b15f6278-bf50-4012-8d7b-6c51c69ee593",
+      "name": "`Symphony Agent Queue`",
+      "url": "https://linear.app/symphonys/project/symphony-agent-queue-c7cc9de0cbf2",
+      "slug_id": "c7cc9de0cbf2"
+    },
+    "project_id": "b15f6278-bf50-4012-8d7b-6c51c69ee593",
+    "project_name": "`Symphony Agent Queue`",
+    "project_slug": "c7cc9de0cbf2",
+    "project_url": "https://linear.app/symphonys/project/symphony-agent-queue-c7cc9de0cbf2",
+    "requested_lanes": [
+      "docs"
+    ],
+    "state_ids": {
+      "Blocked": "4d44f1fa-c485-4bbe-bce2-c6115976895c",
+      "Human Review": "f3cb9d43-d760-4d7e-bc2a-abef14035cfb",
+      "In Progress": "52de130b-c577-4115-b363-16eb1a0be0ba",
+      "Todo": "91a6fe9d-ba37-4a89-b8f9-0fd7a6749e13"
+    },
+    "statuses": [
+      "Backlog",
+      "Todo",
+      "In Progress",
+      "Human Review",
+      "Rework",
+      "Merging",
+      "Blocked",
+      "Done",
+      "Duplicate",
+      "Canceled"
+    ],
+    "supported_lanes": [
+      "docs",
+      "bug",
+      "feature",
+      "refactor",
+      "test",
+      "chore",
+      "research"
+    ],
+    "team": {
+      "id": "98a8f1e6-bbbf-48b1-9b14-ea1201ffc351",
+      "key": null,
+      "name": "Agent Workbench"
+    },
+    "team_id": "98a8f1e6-bbbf-48b1-9b14-ea1201ffc351"
+  },
+  "repo": "moizghumann/symphony",
+  "requested_lanes": [
+    "docs"
+  ],
+  "results": [
+    {
+      "branch_name": "moizghuman/age-20-docs-live-smoke-update-phase-36-validation-note",
+      "validation_reason": "docs-only change",
+      "handoff_comment_id_or_url": "https://linear.app/symphonys/issue/AGE-20/docs-live-smoke-update-phase-36-validation-note#comment-e33ef4af",
+      "external_verification": {
+        "github": {
+          "branch_exists": true,
+          "changed_files": [
+            "docs/validation/phase-3-6-orchestration-validation.md"
+          ],
+          "commit_exists": true,
+          "pr_base_ref": "main",
+          "pr_body": "## Summary\n- Implements AGE-20: Docs live smoke: update Phase 3.6 validation note\n\n## Linear\nhttps://linear.app/symphonys/issue/AGE-20/docs-live-smoke-update-phase-36-validation-note\n\n## Validation\n- See the Symphony Linear handoff comment for the agent-reported validation.\n",
+          "pr_draft": true,
+          "pr_exists": true,
+          "pr_title": "AGE-20: Docs live smoke: update Phase 3.6 validation note",
+          "pr_url": "https://github.com/moizghumann/symphony/pull/8",
+          "status": "completed"
+        },
+        "linear": {
+          "blocker_comment_exists": false,
+          "expected_final_state": "Human Review",
+          "final_state": "Human Review",
+          "handoff_comment_exists": true,
+          "pr_url_posted": true,
+          "research_findings_posted": true,
+          "status": "completed"
+        },
+        "valid": true
+      },
+      "final_state": "Human Review",
+      "product_changed_files": [
+        "docs/validation/phase-3-6-orchestration-validation.md"
+      ],
+      "commit_sha": "f53798d899d220e6db1e15ef662557ad8729497a",
+      "expected_final_state": "Human Review",
+      "handoff_artifact_path": "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20/.phase36/handoff.json",
+      "timeout_diagnostics": null,
+      "completion_states": {
+        "codex_process_started": true,
+        "codex_prompt_delivered": true,
+        "codex_work_observed": true,
+        "lane_contract_satisfied": true,
+        "symphony_handoff_ready_seen": true
+      },
+      "narrow_linear_lifecycle_calls": 2,
+      "cached_input_tokens": null,
+      "budget_state": null,
+      "tool_call_count": 0,
+      "pr_url": "https://github.com/moizghumann/symphony/pull/8",
+      "protocol_violations": [],
+      "supervision": {
+        "codex_process_id": "20751",
+        "codex_session_id": "019e1b05-2d3b-7c40-b75c-a49935bcae70-019e1b05-2dd9-7922-b6a7-8d91ff32eee3",
+        "elapsed_ms": 317415,
+        "finished_at": "2026-05-12T07:14:02Z",
+        "heartbeat_count": 5,
+        "heartbeat_interval_ms": 60000,
+        "last_heartbeat_at": "2026-05-12T07:13:44Z",
+        "last_output_at": "2026-05-12T07:14:01Z",
+        "max_lane_runtime_ms": 1800000,
+        "started_at": "2026-05-12T07:08:44Z",
+        "status": "ok",
+        "workspace_path": "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20"
+      },
+      "validation_command": "not run",
+      "gross_context_tokens": null,
+      "validation_status": "not_run",
+      "blocked_transition": null,
+      "sandbox_writable_roots": [
+        "/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces",
+        "/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/.git",
+        "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20/.git"
+      ],
+      "changed_files": [
+        "docs/validation/phase-3-6-orchestration-validation.md"
+      ],
+      "active_workspace_git_root": "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20/.git",
+      "code_seams_needed": [
+        {
+          "field": "validation_command_result",
+          "seam": "Expose structured validation command output from the Codex handoff."
+        },
+        {
+          "field": "effective_tokens",
+          "seam": "Expose structured Codex usage telemetry from direct AgentRunner live-smoke runs."
+        },
+        {
+          "field": "gross_context_tokens",
+          "seam": "Expose structured Codex usage telemetry from direct AgentRunner live-smoke runs."
+        },
+        {
+          "field": "cached_input_tokens",
+          "seam": "Expose structured Codex usage telemetry from direct AgentRunner live-smoke runs."
+        },
+        {
+          "field": "output_tokens",
+          "seam": "Expose structured Codex usage telemetry from direct AgentRunner live-smoke runs."
+        },
+        {
+          "field": "budget_state",
+          "seam": "Expose final budget state from direct AgentRunner live-smoke runs."
+        }
+      ],
+      "active_workspace_path": "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20",
+      "generic_linear_graphql_calls": 0,
+      "protocol_warnings": [],
+      "repo_changed": true,
+      "lane_contract_status": "passed",
+      "handoff_artifact_status": "handoff_complete",
+      "sandbox_policy_type": "workspaceWrite",
+      "finalization_gate_result": "ok",
+      "linear_issue_identifier": "AGE-20",
+      "blocker_reason": null,
+      "control_artifacts": [
+        ".phase36/handoff.json"
+      ],
+      "lane": "docs",
+      "effective_tokens": null,
+      "classification_reason": "multiple lane signals matched; chose least expensive safe lane over feature",
+      "runner_status": "ok",
+      "handoff_artifact_valid": true,
+      "output_tokens": null,
+      "linear_issue_url": "https://linear.app/symphonys/issue/AGE-20/docs-live-smoke-update-phase-36-validation-note",
+      "validation_command_result": null,
+      "active_workspace_git_root_writable_probe": {
+        "path": "/private/var/folders/rd/0bn_nlzd3pz3y0s9xsy44pk00000gn/T/phase36-live-smoke-workspaces/AGE-20/.git/.symphony-live-smoke-write-probe-5058",
+        "status": "ok"
+      },
+      "missing_evidence": [
+        "validation_command_result",
+        "effective_tokens",
+        "gross_context_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "budget_state"
+      ]
+    }
+  ],
+  "safety_gates": {
+    "CONFIRM_LIVE_SMOKE_MUTATION": "must equal true",
+    "GH_TOKEN_or_GITHUB_TOKEN": "one must be present",
+    "LINEAR_API_KEY": "must be present",
+    "RUN_REAL_SMOKE": "must equal true",
+    "github_preflight": "gh auth status, repo view, and non-mutating push permission check must pass",
+    "linear_preflight": "viewer and exact Agent Workbench statuses must pass",
+    "mix_pubsub_local_socket_preflight": "local socket creation must pass under the command environment"
+  },
+  "supported_lanes": [
+    "docs",
+    "bug",
+    "feature",
+    "refactor",
+    "test",
+    "chore",
+    "research"
+  ]
+}

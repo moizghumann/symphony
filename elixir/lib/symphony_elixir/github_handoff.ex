@@ -8,6 +8,8 @@ defmodule SymphonyElixir.GitHubHandoff do
   alias SymphonyElixir.{Linear.Issue, SSH, Tracker}
   alias SymphonyElixir.Protocol.{Contract, FinalizationGate, Validation}
 
+  @phase36_handoff_path ".phase36/handoff.json"
+
   @type worker_host :: String.t() | nil
   @type result :: :no_repo_changes | {:ok, String.t()} | {:error, term()}
 
@@ -19,20 +21,33 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   @spec complete(Path.t(), Issue.t(), worker_host(), keyword()) :: result()
   def complete(workspace, %Issue{} = issue, worker_host, opts) when is_binary(workspace) and is_list(opts) do
+    contract = Contract.current()
+
     with :ok <- ensure_git_repo(workspace, worker_host),
-         {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host),
+         {:ok, artifacts} <- repo_artifacts(workspace, issue, worker_host, opts),
          true <- artifacts.repo_changed,
-         {:ok, branch} <- ensure_branch(workspace, issue, worker_host),
-         :ok <- ensure_committed(workspace, worker_host),
+         {:ok, branch} <- ensure_branch(workspace, issue, worker_host, opts),
+         :ok <- ensure_committed(workspace, worker_host, issue, opts),
          {:ok, commit_sha} <- head_sha(workspace, worker_host),
-         :ok <- ensure_pushed(workspace, branch, worker_host),
-         {:ok, pr_url} <- create_draft_pr(workspace, branch, issue, worker_host),
+         {:ok, final_branch} <- ensure_pushed(workspace, branch, issue, worker_host, opts),
+         {:ok, pr_url} <- create_draft_pr(workspace, final_branch, issue, worker_host),
          :ok <- post_handoff(issue, pr_url, opts),
+         :ok <-
+           update_phase36_handoff_artifact(workspace, %{
+             branch_name: final_branch,
+             commit_sha: commit_sha,
+             pr_url: pr_url,
+             changed_files: artifacts.changed_files,
+             linear_comment_posted: true,
+             final_state_requested: contract.review_state
+           }),
+         :ok <- ensure_committed(workspace, worker_host, issue, opts),
+         {:ok, final_branch} <- ensure_pushed(workspace, final_branch, issue, worker_host, opts),
          :ok <-
            move_to_human_review(
              issue,
              Map.merge(artifacts, %{
-               branch_name: branch,
+               branch_name: final_branch,
                commit_sha: commit_sha,
                branch_pushed: true,
                pr_url: pr_url,
@@ -73,18 +88,19 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp repo_artifacts(workspace, %Issue{} = issue, worker_host) do
+  defp repo_artifacts(workspace, %Issue{} = issue, worker_host, opts) do
     with {:ok, status} <- run(workspace, "git", ["status", "--porcelain"], worker_host),
          {:ok, ahead} <- run(workspace, "git", ["rev-list", "--count", "origin/main..HEAD"], worker_host),
          {:ok, changed} <- changed_files(workspace, worker_host) do
       repo_changed = String.trim(status) != "" or parse_count(ahead) > 0 or changed != []
-      lane = infer_lane(issue, changed)
+      phase36_artifact = read_phase36_handoff_artifact(workspace, worker_host)
+      {lane, classification_reason} = selected_lane(opts, issue, phase36_artifact, changed)
       validation = Validation.summarize(workspace, changed, lane: lane)
 
       {:ok,
        Map.merge(validation, %{
          lane: lane,
-         classification_reason: "inferred from labels/title/files during handoff",
+         classification_reason: classification_reason,
          repo_changed: repo_changed,
          changed_files: changed,
          branch_name: nil,
@@ -98,7 +114,8 @@ defmodule SymphonyElixir.GitHubHandoff do
          available_states: issue.available_states,
          ticket_text: issue_text(issue),
          budget_state: :ok
-       })}
+       })
+       |> Map.merge(phase36_gate_evidence(phase36_artifact))}
     else
       {:error, reason} -> {:error, {:repo_artifacts_failed, reason}}
     end
@@ -107,7 +124,16 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp changed_files(workspace, worker_host) do
     case run(workspace, "git", ["diff", "--name-only", "origin/main...HEAD"], worker_host) do
       {:ok, output} ->
-        {:ok, parse_changed_files(output)}
+        changed_files =
+          output
+          |> parse_changed_files()
+          |> FinalizationGate.product_changed_files()
+
+        if changed_files == [] do
+          changed_files_from_status(workspace, worker_host)
+        else
+          {:ok, changed_files}
+        end
 
       {:error, _reason} ->
         changed_files_from_status(workspace, worker_host)
@@ -117,15 +143,7 @@ defmodule SymphonyElixir.GitHubHandoff do
   defp changed_files_from_status(workspace, worker_host) do
     case run(workspace, "git", ["status", "--porcelain"], worker_host) do
       {:ok, output} ->
-        files =
-          output
-          |> String.split("\n", trim: true)
-          |> Enum.map(&String.slice(&1, 3..-1//1))
-          |> Enum.map(&String.trim/1)
-          |> Enum.reject(&(&1 == ""))
-          |> Enum.uniq()
-
-        {:ok, files}
+        {:ok, output |> parse_status_changed_files() |> FinalizationGate.product_changed_files()}
 
       {:error, reason} ->
         {:error, reason}
@@ -140,10 +158,23 @@ defmodule SymphonyElixir.GitHubHandoff do
     |> Enum.uniq()
   end
 
-  defp ensure_branch(workspace, %Issue{} = issue, worker_host) do
+  defp parse_status_changed_files(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.slice(&1, 3..-1//1))
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp ensure_branch(workspace, %Issue{} = issue, worker_host, opts) do
     with {:ok, branch} <- current_branch(workspace, worker_host) do
       if branch in ["", "main", "master"] do
-        {:error, {:git_branch_failed, {:invalid_handoff_branch, branch, issue_branch_name(issue)}}}
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          switch_branch(workspace, issue_branch_name(issue), worker_host)
+        else
+          {:error, {:git_branch_failed, {:invalid_handoff_branch, branch, issue_branch_name(issue)}}}
+        end
       else
         {:ok, branch}
       end
@@ -157,9 +188,23 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
+  defp switch_branch(workspace, branch, worker_host) do
+    case run(workspace, "git", ["switch", "-c", branch], worker_host) do
+      {:ok, _output} -> {:ok, branch}
+      {:error, reason} -> {:error, {:git_branch_failed, reason}}
+    end
+  end
+
   defp head_sha(workspace, worker_host) do
     case run(workspace, "git", ["rev-parse", "HEAD"], worker_host) do
       {:ok, output} -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, {:git_commit_failed, reason}}
+    end
+  end
+
+  defp commit_changes(workspace, %Issue{} = issue, worker_host) do
+    case run(workspace, "git", ["commit", "-m", commit_message(issue)], worker_host) do
+      {:ok, _output} -> :ok
       {:error, reason} -> {:error, {:git_commit_failed, reason}}
     end
   end
@@ -177,13 +222,25 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp issue_branch_name(_issue), do: "symphony/issue"
 
-  defp ensure_committed(workspace, worker_host) do
+  defp ensure_committed(workspace, worker_host, issue, opts) do
     case run(workspace, "git", ["status", "--porcelain"], worker_host) do
       {:ok, output} ->
-        if String.trim(output) == "" do
+        product_files =
+          output
+          |> parse_status_changed_files()
+          |> FinalizationGate.product_changed_files()
+
+        if product_files == [] do
           :ok
         else
-          {:error, {:git_commit_failed, {:uncommitted_changes, output}}}
+          if Keyword.get(opts, :auto_publish_from_main, false) do
+            with :ok <- stage_product_changes(workspace, worker_host),
+                 :ok <- commit_changes(workspace, issue, worker_host) do
+              :ok
+            end
+          else
+            {:error, {:git_commit_failed, {:uncommitted_changes, output}}}
+          end
         end
 
       {:error, reason} ->
@@ -191,22 +248,99 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
-  defp ensure_pushed(workspace, branch, worker_host) when is_binary(branch) do
+  defp stage_product_changes(workspace, worker_host) do
+    case run(workspace, "git", ["add", "-A", "--", ":/", ":!.phase36", ":!.phase36/**"], worker_host) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:git_stage_failed, reason}}
+    end
+  end
+
+  defp ensure_pushed(workspace, branch, %Issue{} = issue, worker_host, opts) when is_binary(branch) do
     with {:ok, head_sha} <- run(workspace, "git", ["rev-parse", "HEAD"], worker_host),
          {:ok, remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", branch], worker_host) do
       local_sha = String.trim(head_sha)
 
-      if remote_contains_sha?(remote_output, local_sha) do
-        :ok
-      else
-        {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
-      end
+      push_or_reuse_branch(workspace, branch, issue, local_sha, remote_output, worker_host, opts)
     else
       {:error, reason} -> {:error, {:git_push_failed, reason}}
     end
   end
 
+  defp push_or_reuse_branch(workspace, branch, issue, local_sha, remote_output, worker_host, opts) do
+    case remote_branch_sha(remote_output) do
+      ^local_sha ->
+        {:ok, branch}
+
+      nil ->
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          push_branch(workspace, branch, branch, worker_host)
+        else
+          {:error, {:git_push_failed, {:remote_branch_missing_head, branch, local_sha, remote_output}}}
+        end
+
+      remote_sha ->
+        if Keyword.get(opts, :auto_publish_from_main, false) do
+          retry_branch = retry_branch_name(branch, issue, local_sha)
+
+          with {:ok, retry_remote_output} <- run(workspace, "git", ["ls-remote", "--heads", "origin", retry_branch], worker_host) do
+            case remote_branch_sha(retry_remote_output) do
+              ^local_sha -> {:ok, retry_branch}
+              nil -> push_branch(workspace, branch, retry_branch, worker_host)
+              retry_remote_sha -> {:error, {:git_push_failed, {:remote_branch_conflict, retry_branch, local_sha, retry_remote_sha}}}
+            end
+          else
+            {:error, reason} -> {:error, {:git_push_failed, reason}}
+          end
+        else
+          {:error, {:git_push_failed, {:remote_branch_conflict, branch, local_sha, remote_sha}}}
+        end
+    end
+  end
+
+  defp push_branch(workspace, local_branch, remote_branch, worker_host) when local_branch == remote_branch do
+    case run(workspace, "git", ["push", "-u", "origin", local_branch], worker_host) do
+      {:ok, _output} -> {:ok, remote_branch}
+      {:error, reason} -> {:error, {:git_push_failed, reason}}
+    end
+  end
+
+  defp push_branch(workspace, _local_branch, remote_branch, worker_host) do
+    case run(workspace, "git", ["push", "-u", "origin", "HEAD:refs/heads/#{remote_branch}"], worker_host) do
+      {:ok, _output} -> {:ok, remote_branch}
+      {:error, reason} -> {:error, {:git_push_failed, reason}}
+    end
+  end
+
   defp create_draft_pr(workspace, branch, %Issue{} = issue, worker_host) do
+    case existing_draft_pr_url(workspace, branch, worker_host) do
+      {:ok, pr_url} -> {:ok, pr_url}
+      :not_found -> create_new_draft_pr(workspace, branch, issue, worker_host)
+    end
+  end
+
+  defp existing_draft_pr_url(workspace, branch, worker_host) do
+    args = ["pr", "view", "--head", branch, "--json", "url,isDraft", "--jq", "select(.isDraft == true) | .url"]
+
+    case run(workspace, "gh", args, worker_host) do
+      {:ok, output} ->
+        case extract_url(output) do
+          nil -> :not_found
+          url -> {:ok, url}
+        end
+
+      {:error, {_status, output}} when is_binary(output) ->
+        if String.contains?(String.downcase(output), ["no pull requests found", "not found"]) do
+          :not_found
+        else
+          :not_found
+        end
+
+      {:error, _reason} ->
+        :not_found
+    end
+  end
+
+  defp create_new_draft_pr(workspace, branch, %Issue{} = issue, worker_host) do
     args = [
       "pr",
       "create",
@@ -395,6 +529,46 @@ defmodule SymphonyElixir.GitHubHandoff do
     end
   end
 
+  defp update_phase36_handoff_artifact(workspace, updates) do
+    path = Path.join(workspace, @phase36_handoff_path)
+
+    if File.exists?(path) do
+      with {:ok, body} <- File.read(path),
+           {:ok, %{} = artifact} <- Jason.decode(body),
+           :ok <- write_phase36_handoff_artifact(path, artifact, updates) do
+        :ok
+      else
+        _ -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp write_phase36_handoff_artifact(path, artifact, updates) do
+    handoff =
+      artifact
+      |> Map.get("handoff", %{})
+      |> Map.merge(%{
+        "linear_comment_posted" => updates.linear_comment_posted,
+        "final_state_requested" => updates.final_state_requested
+      })
+
+    artifact =
+      artifact
+      |> Map.merge(%{
+        "status" => "handoff_complete",
+        "repo_changed" => true,
+        "branch_name" => updates.branch_name,
+        "commit_sha" => updates.commit_sha,
+        "pr_url" => updates.pr_url,
+        "changed_files" => updates.changed_files,
+        "handoff" => handoff
+      })
+
+    File.write(path, Jason.encode!(artifact, pretty: true))
+  end
+
   defp extract_url(output) when is_binary(output) do
     ~r/https?:\/\/\S+/
     |> Regex.run(output)
@@ -410,6 +584,94 @@ defmodule SymphonyElixir.GitHubHandoff do
       _ -> 0
     end
   end
+
+  defp selected_lane(opts, %Issue{} = issue, artifact, changed_files) do
+    cond do
+      valid_lane?(Keyword.get(opts, :lane)) ->
+        {normalize_lane(Keyword.fetch!(opts, :lane)), "provided by handoff options"}
+
+      valid_lane?(issue_lane(issue)) ->
+        {normalize_lane(issue_lane(issue)), "preserved from issue lane classification"}
+
+      valid_lane?(artifact_lane(artifact)) ->
+        {normalize_lane(artifact_lane(artifact)), "preserved from .phase36/handoff.json"}
+
+      true ->
+        {infer_lane(issue, changed_files), "inferred from labels/title/files during handoff"}
+    end
+  end
+
+  defp issue_lane(%Issue{lane_classification: %{lane: lane}}), do: lane
+  defp issue_lane(%Issue{lane_classification: %{"lane" => lane}}), do: lane
+  defp issue_lane(_issue), do: nil
+
+  defp artifact_lane(%{} = artifact), do: Map.get(artifact, "lane") || Map.get(artifact, :lane)
+  defp artifact_lane(_artifact), do: nil
+
+  defp valid_lane?(lane) when is_atom(lane), do: lane |> Atom.to_string() |> valid_lane?()
+
+  defp valid_lane?(lane) when is_binary(lane) do
+    lane
+    |> String.downcase()
+    |> then(&(&1 in ["docs", "bug", "feature", "refactor", "test", "chore", "research"]))
+  end
+
+  defp valid_lane?(_lane), do: false
+
+  defp normalize_lane(lane) when is_atom(lane), do: lane |> Atom.to_string() |> normalize_lane()
+  defp normalize_lane(lane) when is_binary(lane), do: lane |> String.trim() |> String.downcase()
+
+  defp read_phase36_handoff_artifact(workspace, nil) do
+    path = Path.join(workspace, @phase36_handoff_path)
+
+    with true <- File.regular?(path),
+         {:ok, body} <- File.read(path),
+         {:ok, %{} = artifact} <- Jason.decode(body) do
+      artifact
+    else
+      _ -> nil
+    end
+  end
+
+  defp read_phase36_handoff_artifact(workspace, worker_host) do
+    case run(workspace, "cat", [@phase36_handoff_path], worker_host) do
+      {:ok, body} ->
+        case Jason.decode(body) do
+          {:ok, %{} = artifact} -> artifact
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp phase36_gate_evidence(nil), do: %{}
+
+  defp phase36_gate_evidence(%{} = artifact) do
+    validation = Map.get(artifact, "validation") || %{}
+
+    %{}
+    |> maybe_put(:targeted_tests_run, artifact_value(artifact, "targeted_tests_run"))
+    |> maybe_put(:test_coverage_added, artifact_value(artifact, "test_coverage_added"))
+    |> maybe_put(:validation_status, first_present([artifact_value(artifact, "validation_status"), artifact_value(validation, "status")]))
+    |> maybe_put(:validation_command, first_present([artifact_value(artifact, "validation_command"), artifact_value(validation, "command")]))
+    |> maybe_put(:validation_reason, first_present([artifact_value(artifact, "validation_reason"), artifact_value(validation, "reason")]))
+  end
+
+  defp artifact_value(%{} = artifact, key), do: Map.get(artifact, key) || Map.get(artifact, String.to_atom(key))
+  defp artifact_value(_artifact, _key), do: nil
+
+  defp first_present(values) do
+    Enum.find(values, fn
+      nil -> false
+      value when is_binary(value) -> String.trim(value) != ""
+      _value -> true
+    end)
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp infer_lane(%Issue{} = issue, changed_files) do
     text =
@@ -451,15 +713,35 @@ defmodule SymphonyElixir.GitHubHandoff do
 
   defp git_not_a_repo_error?(_reason), do: false
 
-  defp remote_contains_sha?(remote_output, local_sha) when is_binary(remote_output) and is_binary(local_sha) do
+  defp remote_branch_sha(remote_output) when is_binary(remote_output) do
     remote_output
     |> String.split("\n", trim: true)
-    |> Enum.any?(fn line ->
-      line
-      |> String.split()
-      |> List.first()
-      |> Kernel.==(local_sha)
-    end)
+    |> List.first()
+    |> case do
+      nil ->
+        nil
+
+      line ->
+        line
+        |> String.split()
+        |> List.first()
+    end
+  end
+
+  defp retry_branch_name(branch, %Issue{} = issue, local_sha) do
+    identifier =
+      issue.identifier
+      |> to_string()
+      |> slug()
+
+    suffix = local_sha |> to_string() |> String.slice(0, 8)
+    base = branch |> String.trim() |> String.trim_trailing("-#{suffix}")
+
+    if String.contains?(base, identifier) do
+      "#{base}-#{suffix}"
+    else
+      "#{base}-#{identifier}-#{suffix}"
+    end
   end
 
   defp slug(value) when is_binary(value) do

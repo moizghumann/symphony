@@ -2,8 +2,37 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
+  alias SymphonyElixir.{GitHubHandoff, JobPacket, LaneClassifier, LanePolicy, PromptBuilder}
   alias SymphonyElixir.Protocol.{Capsule, Contract, FinalizationGate}
+
+  defmodule HandoffCommentIdLinearClient do
+    def fetch_candidate_issues, do: {:ok, []}
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(query, variables) do
+      case Application.get_env(:symphony_elixir, :linear_client_recipient) do
+        pid when is_pid(pid) -> send(pid, {:linear_client_graphql, query, variables})
+        _ -> :ok
+      end
+
+      cond do
+        String.contains?(query, "commentCreate") ->
+          {:ok,
+           %{
+             "data" => %{
+               "commentCreate" => %{
+                 "success" => true,
+                 "comment" => %{"id" => "comment-249"}
+               }
+             }
+           }}
+
+        String.contains?(query, "issueUpdate") ->
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+    end
+  end
 
   @contract %Contract{}
   @states [
@@ -34,6 +63,272 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
         assert is_binary(reason) and reason != ""
         assert is_list(signals) and signals != []
         assert is_binary(version) and version != ""
+      end
+    end
+  end
+
+  describe "GitHub handoff lane preservation" do
+    test "prefers opts lane over inferred lane" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2201",
+          title: "Fix regression in checkout validation"
+        })
+
+      assert_handoff_reaches_human_review(issue, lane: "test")
+    end
+
+    test "prefers issue lane classification over inferred lane" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2202",
+          title: "Fix regression in checkout validation",
+          lane_classification: %{lane: :test, reason: "preclassified test lane"}
+        })
+
+      assert_handoff_reaches_human_review(issue)
+    end
+
+    test "reads lane from valid phase36 handoff artifact when issue classification is absent" do
+      issue =
+        handoff_issue(%{
+          identifier: "AGE-2203",
+          title: "Fix regression in checkout validation"
+        })
+
+      assert_handoff_reaches_human_review(issue)
+    end
+
+    test "add regression tests handoff stays test lane" do
+      issue = handoff_issue(%{identifier: "AGE-2204", title: "Add regression tests for handoff evidence"})
+      classification = LaneClassifier.classify(issue)
+
+      assert classification.lane == :test
+
+      assert_handoff_reaches_human_review(%{issue | lane_classification: classification})
+    end
+  end
+
+  describe "research read-only handoff routing" do
+    test "valid read-only research handoff finalizes through Linear without GitHub PR handoff" do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-research-linear-only-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        codex_binary = Path.join(test_root, "fake-codex")
+        trace_file = Path.join(test_root, "codex.trace")
+
+        File.mkdir_p!(workspace_root)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+        count=0
+
+        while IFS= read -r line; do
+          count=$((count + 1))
+          printf 'JSON:%s\\n' "$line" >> "$trace_file"
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-research-ready"}}}'
+              ;;
+            4)
+              mkdir -p .phase36
+              printf '%s\\n' \
+                '{' \
+                '  "lane": "research",' \
+                '  "linear_issue_identifier": "AGE-26",' \
+                '  "status": "handoff_ready",' \
+                '  "repo_changed": false,' \
+                '  "branch_name": null,' \
+                '  "commit_sha": null,' \
+                '  "pr_url": null,' \
+                '  "changed_files": [],' \
+                '  "research_findings": "Docs are clear for the checked onboarding path.",' \
+                '  "sources_inspected": ["README.md"],' \
+                '  "recommendation": "No repository change is needed.",' \
+                '  "findings_posted": false,' \
+                '  "findings_ready_to_post": true,' \
+                '  "sources_inspected_listed": true,' \
+                '  "recommendation_included": true,' \
+                '  "validation_status": "not_run",' \
+                '  "validation_reason": "read-only research",' \
+                '  "validation": {' \
+                '    "required": false,' \
+                '    "status": "not_run",' \
+                '    "command": "not required",' \
+                '    "reason": "read-only research"' \
+                '  },' \
+                '  "handoff": {' \
+                '    "linear_comment_posted": false,' \
+                '    "final_state_requested": "Human Review"' \
+                '  },' \
+                '  "protocol_notes": ["Findings ready for Symphony-owned Linear handoff."]' \
+                '}' > .phase36/handoff.json
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research-ready"}}}'
+              printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+        System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+        on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          tracker_kind: "linear",
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          max_turns: 3
+        )
+
+        Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+        Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+        on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
+        issue = %Issue{
+          id: "issue-research-ready",
+          identifier: "AGE-26",
+          title: "Investigate read-only handoff routing",
+          description: "Read-only research. Post findings in Linear. No repository changes.",
+          state: "In Progress",
+          labels: ["research"],
+          lane_classification: %{
+            lane: :research,
+            reason: "explicit research lane",
+            matched_signals: ["label:research"],
+            policy_version: "2026-05-10.phase3"
+          },
+          available_states: [%{id: "state-human-review", name: "Human Review"}]
+        }
+
+        assert :ok =
+                 AgentRunner.run(issue, self(),
+                   linear_lifecycle_graphql: &HandoffCommentIdLinearClient.graphql/2,
+                   github_handoff: fn _workspace, _issue, _worker_host, _opts ->
+                     flunk("GitHubHandoff must not run for read-only research")
+                   end,
+                   issue_state_fetcher: fn _issue_ids ->
+                     flunk("research handoff marker should finalize without polling another turn")
+                   end
+                 )
+
+        assert_receive {:linear_client_graphql, comment_query, %{issueId: "issue-research-ready", body: comment}}
+        assert comment_query =~ "commentCreate"
+        assert comment =~ "Findings:"
+        assert comment =~ "Sources inspected:"
+        assert comment =~ "Recommendation:"
+
+        assert_receive {:linear_client_graphql, update_query, %{issueId: "issue-research-ready", stateId: "state-human-review"}}
+        assert update_query =~ "issueUpdate"
+
+        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :linear_lifecycle_call, tool_name: "linear_post_handoff", tool_result: %{success: true}}}
+        assert_receive {:codex_worker_update, "issue-research-ready", %{event: :linear_lifecycle_call, tool_name: "linear_move_to_human_review", tool_result: %{success: true}}}
+
+        trace = File.read!(trace_file)
+        refute trace =~ "No commits between"
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "research handoff-ready marker without artifact blocks before GitHub handoff" do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-phase36-research-missing-artifact-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        codex_binary = Path.join(test_root, "fake-codex")
+
+        File.mkdir_p!(workspace_root)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-research-missing-artifact"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research-missing-artifact"}}}'
+              printf '%s\\n' '{"method":"codex/event/agent_message_content_delta","params":{"msg":{"delta":"SYMPHONY_HANDOFF_READY"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          tracker_kind: "linear",
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          max_turns: 3
+        )
+
+        Application.put_env(:symphony_elixir, :linear_client_module, HandoffCommentIdLinearClient)
+        Application.put_env(:symphony_elixir, :linear_client_recipient, self())
+        on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_recipient) end)
+
+        issue = %Issue{
+          id: "issue-research-missing-artifact",
+          identifier: "AGE-27",
+          title: "Investigate read-only handoff artifact",
+          description: "Read-only research. No repository changes.",
+          state: "In Progress",
+          labels: ["research"],
+          lane_classification: %{
+            lane: :research,
+            reason: "explicit research lane",
+            matched_signals: ["label:research"],
+            policy_version: "2026-05-10.phase3"
+          },
+          available_states: [
+            %{id: "state-human-review", name: "Human Review"},
+            %{id: "state-blocked", name: "Blocked"}
+          ]
+        }
+
+        assert_raise RuntimeError, ~r/:handoff_artifact_missing/, fn ->
+          AgentRunner.run(issue, self(),
+            linear_lifecycle_graphql: &HandoffCommentIdLinearClient.graphql/2,
+            github_handoff: fn _workspace, _issue, _worker_host, _opts ->
+              flunk("GitHubHandoff must not run for read-only research without artifact")
+            end
+          )
+        end
+
+        refute_received {:linear_client_graphql, _query, %{issueId: "issue-research-missing-artifact", stateId: "state-human-review"}}
+        assert_receive {:linear_client_graphql, blocker_query, %{issueId: "issue-research-missing-artifact", body: blocker_comment}}
+        assert blocker_query =~ "commentCreate"
+        assert blocker_comment =~ "handoff_artifact_missing"
+        assert_receive {:linear_client_graphql, blocked_query, %{issueId: "issue-research-missing-artifact", stateId: "state-blocked"}}
+        assert blocked_query =~ "issueUpdate"
+      after
+        File.rm_rf(test_root)
       end
     end
   end
@@ -258,6 +553,106 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       assert output["error"]["code"] == "finalization_gate_blocked"
       assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "pr_required_but_missing"))
     end
+
+    test "research narrow Human Review lifecycle tool cannot bypass research evidence" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+
+      issue =
+        %Issue{
+          id: "issue-research-tool-gate",
+          state: "In Progress",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{
+            "issue_id" => "issue-research-tool-gate",
+            "repo_changed" => false,
+            "lane" => "research",
+            "findings_posted" => true,
+            "sources_inspected_listed" => true,
+            "recommendation_included" => true,
+            "validation_status" => "not_run",
+            "validation_reason" => "read-only research"
+          },
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn _query, _variables ->
+            flunk("Linear state mutation should not run without the research handoff artifact")
+          end
+        )
+
+      assert response["success"] == false
+      output = Jason.decode!(response["output"])
+      assert output["error"]["code"] == "finalization_gate_blocked"
+      assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "research_findings_missing"))
+    end
+
+    test "research handoff artifact fields are extracted into narrow Human Review gate state" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+      write_research_handoff_artifact!(workspace)
+      test_pid = self()
+
+      issue =
+        %Issue{
+          id: "issue-research-artifact-gate",
+          state: "In Progress",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{"issue_id" => "issue-research-artifact-gate", "lane" => "research"},
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn query, variables ->
+            send(test_pid, {:linear_lifecycle_graphql_called, query, variables})
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        )
+
+      assert_received {:linear_lifecycle_graphql_called, query, %{issueId: "issue-research-artifact-gate", stateId: "state-review"}}
+      assert query =~ "issueUpdate"
+      assert response["success"] == true
+      assert Jason.decode!(response["output"])["state"] == "Human Review"
+    end
+
+    test "research Human Review lifecycle tool does not attempt Blocked to Human Review" do
+      workspace = temp_workspace!()
+      on_exit(fn -> File.rm_rf(workspace) end)
+      write_research_handoff_artifact!(workspace)
+
+      issue =
+        %Issue{
+          id: "issue-research-blocked",
+          state: "Blocked",
+          available_states: [%{id: "state-review", name: "Human Review"}],
+          lane_classification: %{lane: :research}
+        }
+
+      response =
+        DynamicTool.execute(
+          "linear_move_to_human_review",
+          %{"issue_id" => "issue-research-blocked", "lane" => "research"},
+          issue: issue,
+          workspace: workspace,
+          linear_lifecycle_graphql: fn _query, _variables ->
+            flunk("Linear state mutation should not run for Blocked -> Human Review")
+          end
+        )
+
+      assert response["success"] == false
+      output = Jason.decode!(response["output"])
+      assert output["error"]["code"] == "finalization_gate_blocked"
+      assert Enum.any?(output["error"]["protocol_violations"], &(&1["code"] == "illegal_state_transition"))
+    end
   end
 
   describe "Layer B dry-run orchestration simulations" do
@@ -365,6 +760,176 @@ defmodule SymphonyElixir.Phase36OrchestrationValidationTest do
       budget_state: :ok
     }
     |> Map.merge(overrides)
+  end
+
+  defp temp_workspace! do
+    workspace = Path.join(System.tmp_dir!(), "symphony-phase36-research-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    workspace
+  end
+
+  defp write_research_handoff_artifact!(workspace) do
+    File.mkdir_p!(Path.join(workspace, ".phase36"))
+
+    File.write!(
+      Path.join(workspace, ".phase36/handoff.json"),
+      Jason.encode!(
+        %{
+          "lane" => "research",
+          "linear_issue_identifier" => "AGE-24",
+          "status" => "handoff_ready",
+          "repo_changed" => false,
+          "branch_name" => nil,
+          "commit_sha" => nil,
+          "pr_url" => nil,
+          "changed_files" => [],
+          "research_findings" => "Docs are clear for the checked onboarding path.",
+          "sources_inspected" => ["README.md"],
+          "recommendation" => "No repository change is needed.",
+          "findings_posted" => true,
+          "findings_ready_to_post" => false,
+          "sources_inspected_listed" => true,
+          "recommendation_included" => true,
+          "validation_status" => "not_run",
+          "validation_reason" => "read-only research",
+          "validation" => %{
+            "required" => false,
+            "status" => "not_run",
+            "command" => "not required",
+            "reason" => "read-only research"
+          },
+          "handoff" => %{
+            "linear_comment_posted" => true,
+            "final_state_requested" => "Human Review"
+          },
+          "protocol_notes" => ["Findings posted to Linear handoff comment."]
+        },
+        pretty: true
+      )
+    )
+  end
+
+  defp handoff_issue(overrides) do
+    defaults = %{
+      id: "issue-#{System.unique_integer([:positive])}",
+      identifier: "AGE-22",
+      title: "Add regression tests for validation",
+      description: "Exercise the Phase 3.6 test lane handoff.",
+      state: "In Progress",
+      branch_name: "symphony/age-22-lane-preservation",
+      labels: [],
+      url: "https://linear.app/symphonys/issue/AGE-22"
+    }
+
+    struct!(Issue, Map.merge(defaults, overrides))
+  end
+
+  defp assert_handoff_reaches_human_review(%Issue{} = issue, opts \\ []) do
+    test_root = Path.join(System.tmp_dir!(), "symphony-handoff-lane-preservation-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_lane_handoff_repo!(test_root, issue.identifier)
+      install_fake_gh!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      assert {:ok, "https://github.com/example/repo/pull/22"} =
+               GitHubHandoff.complete(repo, issue, nil, Keyword.merge([auto_publish_from_main: true], opts))
+
+      assert_receive {:memory_tracker_comment, issue_id, comment}, 1_000
+      assert issue_id == issue.id
+      assert comment =~ "https://github.com/example/repo/pull/22"
+      assert_receive {:memory_tracker_state_update, issue_id, "Human Review"}, 1_000
+      assert issue_id == issue.id
+
+      artifact = repo |> Path.join(".phase36/handoff.json") |> File.read!() |> Jason.decode!()
+      assert artifact["lane"] == "test"
+      assert artifact["handoff"]["final_state_requested"] == "Human Review"
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp prepare_lane_handoff_repo!(test_root, identifier) do
+    repo = Path.join(test_root, "repo")
+    origin = Path.join(test_root, "origin.git")
+
+    File.mkdir_p!(Path.join(repo, "test/product"))
+    File.write!(Path.join(repo, "README.md"), "# test\n")
+    System.cmd("git", ["init", "-b", "main"], cd: repo)
+    System.cmd("git", ["config", "user.name", "Test User"], cd: repo)
+    System.cmd("git", ["config", "user.email", "test@example.com"], cd: repo)
+    System.cmd("git", ["add", "README.md"], cd: repo)
+    System.cmd("git", ["commit", "-m", "initial"], cd: repo)
+    System.cmd("git", ["init", "--bare", origin])
+    System.cmd("git", ["remote", "add", "origin", origin], cd: repo)
+    System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
+
+    File.write!(Path.join(repo, "test/product/runtime_test.exs"), "defmodule RuntimeTest do\n  use ExUnit.Case\n\n  test \"runtime\" do\n    assert true\n  end\nend\n")
+    File.mkdir_p!(Path.join(repo, ".phase36"))
+    File.write!(Path.join(repo, ".phase36/handoff.json"), phase36_test_handoff_artifact(identifier))
+
+    repo
+  end
+
+  defp install_fake_gh!(test_root) do
+    bin_dir = Path.join(test_root, "bin")
+    gh_log = Path.join(test_root, "gh.log")
+    File.mkdir_p!(bin_dir)
+
+    File.write!(Path.join(bin_dir, "gh"), """
+    #!/bin/sh
+    printf '%s\\n' "$*" >> "$GH_LOG"
+    if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+      printf 'no pull requests found\\n'
+      exit 1
+    fi
+    if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+      printf 'https://github.com/example/repo/pull/22\\n'
+      exit 0
+    fi
+    exit 99
+    """)
+
+    File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+    System.put_env("PATH", bin_dir <> ":" <> (System.get_env("PATH") || ""))
+    System.put_env("GH_LOG", gh_log)
+  end
+
+  defp phase36_test_handoff_artifact(identifier) do
+    Jason.encode!(
+      %{
+        "lane" => "test",
+        "linear_issue_identifier" => identifier,
+        "status" => "repository_edit_complete_parent_handoff_pending",
+        "repo_changed" => true,
+        "branch_name" => nil,
+        "commit_sha" => nil,
+        "pr_url" => nil,
+        "changed_files" => ["test/product/runtime_test.exs", ".phase36/handoff.json"],
+        "targeted_tests_run" => true,
+        "test_coverage_added" => true,
+        "validation_status" => "passed",
+        "validation_command" => "mix test test/product/runtime_test.exs",
+        "validation_reason" => "Focused regression test coverage passed.",
+        "validation" => %{
+          "required" => true,
+          "status" => "passed",
+          "command" => "mix test test/product/runtime_test.exs",
+          "reason" => "Focused regression test coverage passed."
+        },
+        "handoff" => %{
+          "linear_comment_posted" => false,
+          "final_state_requested" => false
+        }
+      },
+      pretty: true
+    )
   end
 
   defp running_entry(%Issue{} = issue, overrides) do

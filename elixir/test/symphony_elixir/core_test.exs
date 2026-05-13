@@ -878,6 +878,9 @@ defmodule SymphonyElixir.CoreTest do
     System.cmd("git", ["push", "-u", "origin", "main"], cd: repo)
 
     case scenario do
+      :clean ->
+        :ok
+
       :branch_failure ->
         File.write!(Path.join(repo, "README.md"), "# test\n\nwork on main\n")
 
@@ -902,6 +905,33 @@ defmodule SymphonyElixir.CoreTest do
     File.write!(Path.join(repo, "README.md"), "# test\n\n#{branch}\n")
     System.cmd("git", ["add", "README.md"], cd: repo)
     System.cmd("git", ["commit", "-m", "handoff change"], cd: repo)
+  end
+
+  defp phase36_handoff_artifact(identifier, changed_files) do
+    Jason.encode!(
+      %{
+        "lane" => "docs",
+        "linear_issue_identifier" => identifier,
+        "status" => "repository_edit_complete_parent_handoff_pending",
+        "repo_changed" => true,
+        "branch_name" => nil,
+        "commit_sha" => nil,
+        "pr_url" => nil,
+        "changed_files" => changed_files,
+        "validation" => %{
+          "required" => false,
+          "status" => "not_run",
+          "command" => nil,
+          "reason" => "docs-only change"
+        },
+        "handoff" => %{
+          "linear_comment_posted" => false,
+          "final_state_requested" => false
+        },
+        "protocol_notes" => ["Symphony will finalize git and PR fields after handoff readiness."]
+      },
+      pretty: true
+    )
   end
 
   defp assert_eventually(fun, attempts \\ 20)
@@ -1258,6 +1288,266 @@ defmodule SymphonyElixir.CoreTest do
       assert comment =~ "https://github.com/example/repo/pull/7"
       assert_receive {:memory_tracker_state_update, "issue-age-2", "Human Review"}
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "github handoff auto-commits dirty workspace and enriches phase36 artifact" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-github-handoff-phase36-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_handoff_repo!(test_root, :clean)
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+      File.mkdir_p!(bin_dir)
+      File.mkdir_p!(Path.join(repo, ".phase36"))
+
+      File.write!(Path.join(repo, "README.md"), "# test\n\nPhase 3.6 docs smoke.\n")
+
+      File.write!(
+        Path.join(repo, ".phase36/handoff.json"),
+        Jason.encode!(
+          %{
+            "lane" => "docs",
+            "linear_issue_identifier" => "AGE-36",
+            "status" => "repository_edit_complete_parent_handoff_pending",
+            "repo_changed" => true,
+            "branch_name" => nil,
+            "commit_sha" => nil,
+            "pr_url" => nil,
+            "changed_files" => ["README.md"],
+            "validation" => %{
+              "required" => false,
+              "status" => "not_run",
+              "command" => nil,
+              "reason" => "docs-only change"
+            },
+            "handoff" => %{
+              "linear_comment_posted" => false,
+              "final_state_requested" => false
+            },
+            "protocol_notes" => ["Symphony will finalize git and PR fields after handoff readiness."]
+          },
+          pretty: true
+        )
+      )
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+        printf 'https://github.com/example/repo/pull/36\\n'
+        exit 0
+      fi
+      exit 99
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-age-36",
+        identifier: "AGE-36",
+        title: "Phase 3.6 docs smoke",
+        state: "In Progress",
+        branch_name: "symphony/age-36",
+        url: "https://linear.app/symphonys/issue/AGE-36"
+      }
+
+      assert {:ok, "https://github.com/example/repo/pull/36"} =
+               SymphonyElixir.GitHubHandoff.complete(repo, issue, nil, auto_publish_from_main: true)
+
+      assert File.read!(gh_log) =~ "pr create --draft --head symphony/age-36 --base main"
+      assert String.trim(elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0)) == "README.md"
+      refute elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0) =~ ".phase36/handoff.json"
+
+      artifact = repo |> Path.join(".phase36/handoff.json") |> File.read!() |> Jason.decode!()
+      assert artifact["status"] == "handoff_complete"
+      assert artifact["branch_name"] == "symphony/age-36"
+      assert artifact["commit_sha"] =~ ~r/^[0-9a-f]{40}$/
+      assert artifact["pr_url"] == "https://github.com/example/repo/pull/36"
+      assert artifact["handoff"]["linear_comment_posted"] == true
+      assert artifact["handoff"]["final_state_requested"] == "Human Review"
+
+      assert_receive {:memory_tracker_comment, "issue-age-36", comment}
+      assert comment =~ "https://github.com/example/repo/pull/36"
+      assert_receive {:memory_tracker_state_update, "issue-age-36", "Human Review"}
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "github handoff selects unique retry branch when auto-publish branch collides" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-github-handoff-branch-collision-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_handoff_repo!(test_root, :clean)
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+      File.mkdir_p!(bin_dir)
+      File.mkdir_p!(Path.join(repo, ".phase36"))
+
+      System.cmd("git", ["switch", "-c", "remote-conflict"], cd: repo)
+      File.write!(Path.join(repo, "README.md"), "# test\n\nremote branch content\n")
+      System.cmd("git", ["add", "README.md"], cd: repo)
+      System.cmd("git", ["commit", "-m", "remote conflict"], cd: repo)
+      {remote_sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+      System.cmd("git", ["push", "origin", "HEAD:refs/heads/symphony/age-37"], cd: repo)
+      System.cmd("git", ["switch", "main"], cd: repo)
+
+      File.write!(Path.join(repo, "README.md"), "# test\n\nlocal docs smoke\n")
+
+      File.write!(
+        Path.join(repo, ".phase36/handoff.json"),
+        phase36_handoff_artifact("AGE-37", ["README.md"])
+      )
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+        printf 'no pull requests found\\n'
+        exit 1
+      fi
+      if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+        printf 'https://github.com/example/repo/pull/37\\n'
+        exit 0
+      fi
+      exit 99
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-age-37",
+        identifier: "AGE-37",
+        title: "Phase 3.6 docs smoke",
+        state: "In Progress",
+        branch_name: "symphony/age-37",
+        url: "https://linear.app/symphonys/issue/AGE-37"
+      }
+
+      assert {:ok, "https://github.com/example/repo/pull/37"} =
+               SymphonyElixir.GitHubHandoff.complete(repo, issue, nil, auto_publish_from_main: true)
+
+      artifact = repo |> Path.join(".phase36/handoff.json") |> File.read!() |> Jason.decode!()
+      final_branch = artifact["branch_name"]
+      local_sha = artifact["commit_sha"]
+
+      assert final_branch =~ "age-37"
+      assert final_branch != "symphony/age-37"
+      assert String.ends_with?(final_branch, String.slice(local_sha, 0, 8))
+
+      gh_log_body = File.read!(gh_log)
+      assert gh_log_body =~ "pr view --head #{final_branch}"
+      assert gh_log_body =~ "pr create --draft --head #{final_branch} --base main"
+
+      {retry_remote_sha, 0} = System.cmd("git", ["ls-remote", "origin", "refs/heads/#{final_branch}"], cd: repo)
+      assert retry_remote_sha =~ local_sha
+
+      {original_remote_sha, 0} = System.cmd("git", ["ls-remote", "origin", "refs/heads/symphony/age-37"], cd: repo)
+      assert original_remote_sha =~ String.trim(remote_sha)
+      refute original_remote_sha =~ local_sha
+
+      refute gh_log_body =~ "--force"
+      assert String.trim(elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0)) == "README.md"
+      refute elem(System.cmd("git", ["diff", "--name-only", "main...HEAD"], cd: repo), 0) =~ ".phase36/handoff.json"
+
+      assert_receive {:memory_tracker_comment, "issue-age-37", comment}
+      assert comment =~ "https://github.com/example/repo/pull/37"
+      assert_receive {:memory_tracker_state_update, "issue-age-37", "Human Review"}
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "github handoff reuses existing draft PR for exact head branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-github-handoff-existing-pr-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_gh_log = System.get_env("GH_LOG")
+
+    try do
+      repo = prepare_handoff_repo!(test_root, :clean)
+      bin_dir = Path.join(test_root, "bin")
+      gh_log = Path.join(test_root, "gh.log")
+      File.mkdir_p!(bin_dir)
+      File.write!(Path.join(repo, "README.md"), "# test\n\nreuse existing PR\n")
+
+      File.write!(Path.join(bin_dir, "gh"), """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+        printf 'https://github.com/example/repo/pull/38\\n'
+        exit 0
+      fi
+      if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+        printf 'unexpected create\\n'
+        exit 98
+      fi
+      exit 99
+      """)
+
+      File.chmod!(Path.join(bin_dir, "gh"), 0o755)
+      System.put_env("PATH", bin_dir <> ":" <> (previous_path || ""))
+      System.put_env("GH_LOG", gh_log)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-age-38",
+        identifier: "AGE-38",
+        title: "Reuse existing PR",
+        state: "In Progress",
+        branch_name: "symphony/age-38",
+        url: "https://linear.app/symphonys/issue/AGE-38"
+      }
+
+      assert {:ok, "https://github.com/example/repo/pull/38"} =
+               SymphonyElixir.GitHubHandoff.complete(repo, issue, nil, auto_publish_from_main: true)
+
+      gh_log_body = File.read!(gh_log)
+      assert gh_log_body =~ "pr view --head symphony/age-38"
+      refute gh_log_body =~ "pr create"
+
+      assert_receive {:memory_tracker_comment, "issue-age-38", comment}
+      assert comment =~ "https://github.com/example/repo/pull/38"
+      assert_receive {:memory_tracker_state_update, "issue-age-38", "Human Review"}
+    after
+      restore_env("PATH", previous_path)
+      restore_env("GH_LOG", previous_gh_log)
       File.rm_rf(test_root)
     end
   end
@@ -1878,6 +2168,10 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(Path.join(bin_dir, "gh"), """
       #!/bin/sh
       printf '%s\\n' "$*" >> "$GH_LOG"
+      if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+        printf 'no pull requests found\\n'
+        exit 1
+      fi
       printf 'https://github.com/example/repo/pull/249\\n'
       """)
 
@@ -1993,6 +2287,35 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-research"}}}'
+            mkdir -p .phase36
+            cat > .phase36/handoff.json <<'JSON'
+            {
+              "lane": "research",
+              "linear_issue_identifier": "MT-RESEARCH",
+              "status": "handoff_ready",
+              "repo_changed": false,
+              "branch_name": null,
+              "commit_sha": null,
+              "pr_url": null,
+              "changed_files": [],
+              "findings_posted": true,
+              "sources_inspected_listed": true,
+              "recommendation_included": true,
+              "validation_status": "not_run",
+              "validation_reason": "read-only research",
+              "validation": {
+                "required": false,
+                "status": "not_run",
+                "command": "not required",
+                "reason": "read-only research"
+              },
+              "handoff": {
+                "linear_comment_posted": true,
+                "final_state_requested": "Human Review"
+              },
+              "protocol_notes": ["Findings posted to Linear handoff comment."]
+            }
+            JSON
             printf '%s\\n' '{"id":201,"method":"item/tool/call","params":{"name":"linear_post_handoff","callId":"call-handoff","threadId":"thread-research","turnId":"turn-research","arguments":{"issue_id":"issue-research-handoff","body":"README onboarding is clear; no repo changes needed."}}}'
             ;;
           5)

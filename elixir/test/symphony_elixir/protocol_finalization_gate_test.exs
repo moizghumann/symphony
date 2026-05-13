@@ -58,6 +58,35 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert violation?(result, :docs_lane_source_change)
   end
 
+  test "docs lane ignores phase36 control artifact when checking source changes" do
+    run_state =
+      base_run_state(%{
+        lane: "docs",
+        changed_files: ["docs/foo.md", ".phase36/handoff.json"],
+        validation_required: false,
+        validation_status: :not_run,
+        validation_reason: "docs-only/text-only change"
+      })
+
+    assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    refute violation?(result, :docs_lane_source_change)
+    assert result.changed_files == ["docs/foo.md"]
+  end
+
+  test "docs lane still treats non-phase36 json as code config" do
+    run_state =
+      base_run_state(%{
+        lane: "docs",
+        changed_files: ["docs/foo.md", "config/example.json"],
+        validation_required: false,
+        validation_status: :not_run,
+        validation_reason: "docs-only/text-only change"
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :docs_lane_source_change)
+  end
+
   test "feature lane blocks runtime change when validation is missing" do
     run_state =
       base_run_state(%{
@@ -72,6 +101,31 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
     assert violation?(result, :feature_validation_missing)
   end
 
+  test "repo-changing lanes require branch commit pushed pr and Linear handoff before Human Review" do
+    run_state =
+      base_run_state(%{
+        lane: "feature",
+        changed_files: ["lib/product/runtime.ex"],
+        branch_name: nil,
+        commit_sha: nil,
+        branch_pushed: false,
+        pr_url: nil,
+        pr_created: false,
+        pr_posted_to_linear: false,
+        handoff_posted: false,
+        validation_status: :passed,
+        tests_added: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :branch_missing)
+    assert violation?(result, :commit_missing)
+    assert violation?(result, :branch_not_pushed)
+    assert violation?(result, :pr_required_but_missing)
+    assert violation?(result, :pr_url_not_posted_to_linear)
+    assert violation?(result, :handoff_missing)
+  end
+
   test "bug lane blocks fix without failure signal" do
     run_state =
       base_run_state(%{
@@ -83,6 +137,19 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
 
     assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
     assert violation?(result, :bug_failure_signal_identified)
+  end
+
+  test "bug lane blocks fix without affected-file inspection" do
+    run_state =
+      base_run_state(%{
+        lane: "bug",
+        changed_files: ["lib/product/runtime.ex"],
+        validation_status: :passed,
+        failure_signal_identified: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :affected_files_not_inspected)
   end
 
   test "refactor lane allows behavior-preserving validated PR" do
@@ -112,6 +179,32 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
 
     assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
     assert result.finalization_gate_result == :ok
+  end
+
+  test "test lane blocks when targeted test evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "test",
+        changed_files: ["test/product/runtime_test.exs"],
+        validation_status: :passed,
+        test_coverage_added: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :tests_not_run)
+  end
+
+  test "test lane blocks when coverage evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "test",
+        changed_files: ["test/product/runtime_test.exs"],
+        validation_status: :passed,
+        targeted_tests_run: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :test_coverage_missing)
   end
 
   test "chore lane blocks config change when validation is missing" do
@@ -148,6 +241,54 @@ defmodule SymphonyElixir.Protocol.FinalizationGateTest do
 
     assert {:ok, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
     assert result.pr_required == false
+  end
+
+  test "research lane blocks when findings evidence is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        sources_inspected_listed: true,
+        recommendation_included: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_findings_missing)
+  end
+
+  test "research lane blocks when inspected sources are missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        findings_posted: true,
+        recommendation_included: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_sources_missing)
+  end
+
+  test "research lane blocks when recommendation is missing" do
+    run_state =
+      base_run_state(%{
+        lane: "research",
+        repo_changed: false,
+        changed_files: [],
+        validation_required: false,
+        validation_status: :not_run,
+        findings_posted: true,
+        sources_inspected_listed: true
+      })
+
+    assert {:blocked, result} = FinalizationGate.evaluate(run_state, "Human Review", @contract)
+    assert violation?(result, :research_conclusion_missing)
   end
 
   test "research lane with committed markdown artifact and PR can move to Human Review" do

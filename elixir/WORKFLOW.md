@@ -120,9 +120,9 @@ Follow the lane policy exactly:
 
 Codex owns repository work only: inspect, edit when allowed, validate, commit, push, and summarize. Symphony owns draft PR creation, Linear handoff comments, PR URL recording, and `Human Review`/`Blocked` transitions after Codex finishes.
 
-When repository work is complete, committed, pushed, and validated according to the lane policy, finish with the exact marker `SYMPHONY_HANDOFF_READY`.
+Do not finish with the exact marker `SYMPHONY_HANDOFF_READY` until the required lane handoff artifact exists. When repository work is complete, committed, pushed, and validated according to the lane policy, finish with that marker.
 
-Research lane exception: if the packet says no repository artifact is required, do not create a branch/commit/PR and do not emit `SYMPHONY_HANDOFF_READY`. Post concise findings with `linear_post_handoff`, then move the issue to `Human Review` with `linear_move_to_human_review`. If findings cannot be posted, use `linear_post_blocker` and move to `Blocked`.
+Research lane exception: if the packet says no repository artifact is required, stay read-only, inspect and list sources, write `.phase36/handoff.json` with `research_findings`, `sources_inspected`, `recommendation`, `findings_ready_to_post`, `sources_inspected_listed`, `recommendation_included`, `validation_status=not_run`, and `validation_reason=read-only research`, then emit `SYMPHONY_HANDOFF_READY`. Do not create a branch/commit/PR, post directly to Linear, or move the issue to `Human Review` unless Symphony explicitly asks for fallback.
 
 {% if attempt %}
 Continuation attempt #{{ attempt }}:
